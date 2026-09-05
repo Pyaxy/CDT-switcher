@@ -1,0 +1,51 @@
+# cdt_switcher 配置模板 —— 复制为 config.yaml 后填写（config.yaml 已被 .gitignore 排除，绝不提交）
+# 所有 thresholds 字段均可省略（用默认值），也可被同名环境变量覆盖（见各字段注释）
+
+accounts:
+  # 账号 A（阿里云国际站，RAM 子账号 AK，权限：ECS 启停/查询 + cdt:ListCdtInternetTraffic，限定实例 ARN）
+  A:
+    region: cn-hongkong
+    access_key_id: "YOUR_ACCOUNT_A_ACCESS_KEY_ID"
+    access_key_secret: "YOUR_ACCOUNT_A_ACCESS_KEY_SECRET"
+    instance_id: "YOUR_ACCOUNT_A_INSTANCE_ID"
+    instance_name: "节点 A"        # 可选；TG 优先显示它，省略则自动读取 ECS InstanceName
+    eip: "203.0.113.10"            # 文档示例地址；替换成该账号绑定的 EIP
+    service_port: 31227            # T3 对 EIP:此端口做 TCP 探测，填写实际要检查的服务端口
+    # ecs_endpoint: ""             # 可选，默认 ecs.<region>.aliyuncs.com
+    # cdt_endpoint: "cdt.aliyuncs.com"
+  # 账号 B
+  B:
+    region: cn-hongkong
+    access_key_id: "YOUR_ACCOUNT_B_ACCESS_KEY_ID"
+    access_key_secret: "YOUR_ACCOUNT_B_ACCESS_KEY_SECRET"
+    instance_id: "YOUR_ACCOUNT_B_INSTANCE_ID"
+    instance_name: "节点 B"
+    eip: "203.0.113.11"
+    service_port: 31227
+
+telegram:
+  bot_token: "YOUR_TELEGRAM_BOT_TOKEN"
+  chat_ids: [123456789]            # 示例 ID；替换成授权用户或群组 ID
+
+thresholds:                        # 全部可选；环境变量优先级更高
+  patrol_interval_sec: 60          # PATROL_INTERVAL
+  traffic_interval_min: 20         # TRAFFIC_INTERVAL
+  traffic_threshold_gb: 188        # TRAFFIC_THRESHOLD_GB（对 200GB 非内地额度，含 12GB 延迟缓冲）
+  tmax_hours: 360                  # TMAX_HOURS（均衡手段；流量通常先撞线）
+  start_timeout_sec: 600           # START_TIMEOUT
+  probe_interval_sec: 5            # T3 每次 TCP 探测的间隔
+  probe_required_success: 3        # T3 连续成功次数；未满足前绝不停旧机
+  probe_timeout_sec: 240           # PROBE_TIMEOUT，超时则停新机并回滚
+  stop_timeout_sec: 600            # STOP_TIMEOUT
+  stop_retry_interval_sec: 300     # STOP_RETRY_INTERVAL
+  stop_alarm_interval_sec: 1800    # STOP_ALARM_INTERVAL
+  alert_repeat_interval_sec: 1800  # ALERT_REPEAT_INTERVAL；同类 TG 告警最短重复间隔
+  traffic_stale_sec: 3600          # TRAFFIC_STALE；超过此时间的流量快照不得参与选机
+  traffic_retention_days: 180      # TRAFFIC_RETENTION_DAYS；每日自动清理更旧的流量快照
+  event_retention_days: 180        # EVENT_RETENTION_DAYS；每日自动清理更旧的事件
+  runtime_retention_months: 24     # RUNTIME_RETENTION_MONTHS；保留最近月份的运行时长
+  auto_switch_on_service_down: false   # AUTO_SWITCH_ON_SERVICE_DOWN（默认只告警不切换）
+  enable_eventbridge_webhook: false    # ENABLE_EVENTBRIDGE_WEBHOOK（EXPERIMENTAL，需安全隧道或反向代理暴露）
+  webhook_listen: "127.0.0.1:8787"
+  db_path: "rotator.db"            # DB_PATH
+  state_path: "state.json"         # STATE_PATH

@@ -1,0 +1,25 @@
+[Unit]
+Description=CDT-switcher - Aliyun multi-account spot ECS rotator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 部署在第三方常开设备（绝不跑在被管 ECS 上）
+User=cdt-switcher
+Group=cdt-switcher
+UMask=0077
+WorkingDirectory=/opt/cdt-switcher
+ExecStart=/opt/cdt-switcher/.venv/bin/python /opt/cdt-switcher/cdt_switcher.py /opt/cdt-switcher/config.yaml
+Environment=TZ=Asia/Shanghai
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+NoNewPrivileges=true
+PrivateTmp=true
+LogRateLimitIntervalSec=60s
+LogRateLimitBurst=300
+# 崩溃即拉起；首轮 reconcile 只读，游标幂等续跑
+
+[Install]
+WantedBy=multi-user.target

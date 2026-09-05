@@ -1,0 +1,5 @@
+requests==2.34.2
+PyYAML==6.0.3
+APScheduler==3.11.3
+alibabacloud-tea-openapi==0.4.6
+alibabacloud-tea-util==0.3.15
