@@ -41,6 +41,7 @@ chmod 600 config.yaml
 - [部署教程](docs/deploy.md)
 - [状态机设计](docs/state-machine.md)
 - [OOS 看门狗配置](docs/oos-setup.md)
+- [独立只读账单查询（终端验证，尚未接入 Telegram）](docs/billing.md)
 
 ## 安全提示
 
