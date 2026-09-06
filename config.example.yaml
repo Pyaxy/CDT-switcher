@@ -8,7 +8,7 @@ accounts:
     access_key_id: "YOUR_ACCOUNT_A_ACCESS_KEY_ID"
     access_key_secret: "YOUR_ACCOUNT_A_ACCESS_KEY_SECRET"
     instance_id: "YOUR_ACCOUNT_A_INSTANCE_ID"
-    instance_name: "节点 A"        # 可选；TG 优先显示它，省略则自动读取 ECS InstanceName
+    instance_name: "节点 A"        # 可选；通知、账单优先显示它，省略则主程序读取 ECS InstanceName
     eip: "203.0.113.10"            # 文档示例地址；替换成该账号绑定的 EIP
     service_port: 31227            # T3 对 EIP:此端口做 TCP 探测，填写实际要检查的服务端口
     # ecs_endpoint: ""             # 可选，默认 ecs.<region>.aliyuncs.com
@@ -26,6 +26,10 @@ accounts:
 telegram:
   bot_token: "YOUR_TELEGRAM_BOT_TOKEN"
   chat_ids: [123456789]            # 示例 ID；替换成授权用户或群组 ID
+
+billing:
+  enabled: false                  # 显式设为 true 才启用 /bill 和每日费用汇总；省略默认关闭
+  # 复用各账户 AK；额外只读权限 bss:DescribeBillList，见 docs/billing.md。
 
 thresholds:                        # 全部可选；环境变量优先级更高
   patrol_interval_sec: 60          # PATROL_INTERVAL

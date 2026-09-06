@@ -9,7 +9,9 @@
 - 严格区分未知状态、实例不存在、普通停机和节省停机。
 - 流量或运行时长超限时自动调度；无可用节点时进入全局保护停机。
 - 目标服务连续 TCP 探测成功后才停止原节点。
-- Telegram 通知及 `/check`、`/traffic`、`/switch`、`/breaker`、`/resume`、`/last` 命令。
+- Telegram 通知及 `/check`、`/traffic`、`/bill`、`/switch`、`/breaker`、`/resume`、`/last` 命令。
+- 配置 `billing.enabled: true` 后启用 `/bill` 本月账单、`/bill 账号键` 产品费用和每日费用汇总；默认关闭，五分钟内重复查询复用结果。
+- 通知优先显示配置的 `instance_name`，保留 `[账号键]` 方便输入命令。
 - 兼容 OOS `duty=on` 标签看门狗，包含本机进程互斥和 SQLite 历史清理。
 
 ## 快速开始
@@ -41,7 +43,7 @@ chmod 600 config.yaml
 - [部署教程](docs/deploy.md)
 - [状态机设计](docs/state-machine.md)
 - [OOS 看门狗配置](docs/oos-setup.md)
-- [独立只读账单查询（终端验证，尚未接入 Telegram）](docs/billing.md)
+- [账单查询与 Telegram 集成](docs/billing.md)
 
 ## 安全提示
 

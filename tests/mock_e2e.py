@@ -7,6 +7,7 @@ import re
 import sys
 import tempfile
 import time
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import cdt_switcher as m  # noqa: E402
@@ -89,7 +90,7 @@ class FakeTG:
     def send(self, text):
         self.messages.append(text)
 
-    def register_commands(self):
+    def register_commands(self, billing_enabled=False):
         pass
 
     def start_polling(self, cb):
@@ -564,21 +565,25 @@ def s18_tg_retry_and_token_redaction():
 
 
 def s19_check_matches_daily_summary():
-    """/check 与每日任务必须共享完全相同的汇总正文。"""
+    """每日任务保留 /check 状态正文，并附加账单。"""
     r, fakes, store, sj, tg = make_world()
+    r.cfg.billing.enabled = True
     ticks(r)
     store.add_traffic("A", 999.0)
     r._tg_check()
     manual = tg.messages[-1]
-    r.daily_report()
+    with patch.object(m.billing, "query_overview", return_value=[]):
+        r.daily_report()
     daily = tg.messages[-1]
-    assert manual.splitlines()[1:] == daily.splitlines()[1:]
+    daily_status, bill = daily.split("\n\n💰 本月账单", 1)
+    assert manual.splitlines()[1:] == daily_status.splitlines()[1:]
+    assert "暂无账单条目" in bill
     assert manual.startswith("📋 运行状态报告")
     assert daily.startswith("🕘 每日运行报告")
     assert "系统状态：" in manual and "当前节点：" in manual
     assert "状态：" in manual and "本月流量已达到保护阈值" in manual
     assert "obs=" not in manual
-    print("S19 /check 与每日汇总正文一致 通过")
+    print("S19 每日汇总保留状态正文并附加账单 通过")
 
 
 def s20_n_accounts_and_instance_names():

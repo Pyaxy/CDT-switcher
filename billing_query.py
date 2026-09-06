@@ -153,7 +153,7 @@ def query_overview(account: BillingAccount, month: str) -> list[BillRow]:
     return result
 
 
-def format_overview(rows: list[BillRow]) -> str:
+def format_overview(rows: list[BillRow], *, include_products: bool = True) -> str:
     if not rows:
         return "  本月接口暂无账单条目（不代表未产生费用）。"
     grouped: dict[tuple[str, str, str], Decimal] = {}
@@ -169,9 +169,10 @@ def format_overview(rows: list[BillRow]) -> str:
     for (currency, kind), amount in sorted(totals.items()):
         title = BILL_TYPES.get(kind, display(kind))
         lines.append(f"  {title} · 税前金额小计：{currency} {amount:f}")
-        for (ccy, typ, product), value in sorted(grouped.items()):
-            if (ccy, typ) == (currency, kind):
-                lines.append(f"    {display(product)}：{currency} {value:f}")
+        if include_products:
+            for (ccy, typ, product), value in sorted(grouped.items()):
+                if (ccy, typ) == (currency, kind):
+                    lines.append(f"    {display(product)}：{currency} {value:f}")
     return "\n".join(lines)
 
 

@@ -1,6 +1,5 @@
-# CDT-switcher —— 单文件组装件（开头部分）
-# 单文件守护进程，按功能区块组织。
-# 全部 import 集中在本文件（Section 0），后续 Section 不得再 import。
+# CDT-switcher —— 守护进程入口，按功能区块组织；账单查询复用 billing_query 模块。
+# 本文件的 import 集中在 Section 0。
 
 # ===== Section 0: 常量 / 异常 / 日志 =====
 from __future__ import annotations
@@ -14,6 +13,7 @@ from typing import Callable, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests, yaml
+import billing_query as billing
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from alibabacloud_tea_openapi.client import Client as OpenApiClient
@@ -190,10 +190,26 @@ class Thresholds:
 
 
 @dataclass
+class BillingCfg:
+    enabled: bool = False
+
+
+@dataclass(frozen=True)
+class BillSnapshot:
+    summary: Optional[str]
+    products: Optional[str]
+    queried_at: Optional[str]
+    attempted_at: str
+    attempted_mono: float
+    error: str = ""
+
+
+@dataclass
 class Config:
     accounts: dict[str, AccountCfg]
     tg: TGCfg
     th: Thresholds
+    billing: BillingCfg = field(default_factory=BillingCfg)
 
 
 # 环境变量 → Thresholds 字段（存在即覆盖，类型转换失败则告警忽略）
@@ -376,7 +392,13 @@ def load_config(path: str = "config.yaml") -> Config:
 
     _validate_config(accounts, th)
 
-    return Config(accounts=accounts, tg=tg, th=th)
+    billing_raw = data.get("billing", {})
+    if not isinstance(billing_raw, dict):
+        raise ValueError("billing 必须是对象")
+    enabled = billing_raw.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("billing.enabled 必须是布尔值 true 或 false")
+    return Config(accounts=accounts, tg=tg, th=th, billing=BillingCfg(enabled=enabled))
 
 
 # ===== Section 2: 阿里云账号客户端 =====
@@ -1021,9 +1043,18 @@ class TGClient:
         if not self._token or not self._chat_ids:
             return
         # 全部通知均为纯文本：统一转义 & < >，防止内容含特殊字符导致 TG 400 静默丢失
-        safe = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        for cid in self._chat_ids:
-            self._enqueue_send(cid, safe)
+        # 产品明细可能超出单条消息上限；先按原文分段，再转义，避免切断 HTML 实体。
+        # 1800 个 Unicode 字符最多占 3600 个 UTF-16 单元，留出余量。
+        while text:
+            end = min(len(text), 1800)
+            if end < len(text):
+                newline = text.rfind("\n", 0, end)
+                if newline >= 0:
+                    end = newline + 1
+            chunk, text = text[:end], text[end:]
+            safe = chunk.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            for cid in self._chat_ids:
+                self._enqueue_send(cid, safe)
 
     def _send_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -1064,8 +1095,8 @@ class TGClient:
             )
             self._enqueue_send(cid, text, attempt=next_attempt, delay=wait)
 
-    def register_commands(self) -> None:
-        # 注册机器人命令菜单（六条，description 中文）
+    def register_commands(self, billing_enabled: bool = False) -> None:
+        # 注册机器人命令菜单（description 中文）
         if not self._token:
             return
         commands = [
@@ -1076,6 +1107,8 @@ class TGClient:
             {"command": "resume", "description": "从保护停机中恢复服务"},
             {"command": "last", "description": "查看最近 10 条系统事件"},
         ]
+        if billing_enabled:
+            commands.insert(2, {"command": "bill", "description": "查看本月账单，填写账号键可展开产品费用"})
         try:
             resp = requests.post(
                 self._api_url("setMyCommands"),
@@ -1181,6 +1214,7 @@ class TGClient:
 
 class Rotator:
     MAX_INTENT_QUEUE_SIZE = 100
+    BILL_REUSE_SEC = 300  # 手动查询五分钟内复用本轮成功或失败结果
 
     def __init__(self, cfg: Config, store: StateStore, sj: StateJson, tg: TGClient) -> None:
         self.cfg = cfg
@@ -1202,6 +1236,13 @@ class Rotator:
         self._notification_last: dict[str, float] = {}  # 重复告警节流
         self._tick_lock = threading.Lock()
         self._traffic_lock = threading.Lock()
+        self._billing_lock = threading.Lock()  # 账单查询串行，与控制锁独立
+        self._bill_command_lock = threading.Lock()  # 仅保护后台任务调度，不持锁请求网络
+        self._bill_thread: Optional[threading.Thread] = None
+        self._bill_running = False
+        self._bill_requests: set[Optional[str]] = set()  # 最多账户数 + 1 个查询视图
+        self._bill_cache_month = ""
+        self._bill_cache: dict[str, BillSnapshot] = {}  # 每账户仅保留当月最近一次汇总
         self._breaker_requested = threading.Event()
         self._first_done = False          # 首轮 reconcile 是否完成
 
@@ -1309,12 +1350,122 @@ class Rotator:
         self._tg_traffic(values, errors, title="📡 实时流量报告")
 
     def daily_report(self) -> None:
-        # 23:58 汇总（流量 + 时长 + 额度预警），兼心跳（要求：六类通知外每日汇总）
+        # 调度器线程查询账单，不占用 tick 锁，也不参与额度保护或选机。
         try:
-            self.tg.send(self._summary_text("🕘 每日运行报告"))
+            report = self._summary_text("🕘 每日运行报告")
+            if self.cfg.billing.enabled:
+                try:
+                    report += "\n\n" + self._billing_report_text(force=True)
+                except Exception:
+                    report += "\n\n⚠️ 账单查询未完成，金额未知。"
+            self.tg.send(report)
             self.store.log_event("daily", "每日汇总已进入发送队列")
         except Exception:
             LOGGER.exception("daily_report 异常")
+
+    def _billing_report_text(self, selected: Optional[str] = None, *, force: bool = False) -> str:
+        """只缓存当月格式化汇总；失败保留旧值并明确标记，不改变控制状态。"""
+        if not self.cfg.billing.enabled:
+            return "账单功能未启用。"
+        requested_at = time.monotonic()
+        with self._billing_lock:
+            month = datetime.now(billing.BILL_TZ).strftime("%Y-%m")
+            if month != self._bill_cache_month:
+                self._bill_cache.clear()
+                self._bill_cache_month = month
+            lines = [f"💰 本月账单 · {month}", "━━━━━━━━━━━━"]
+            names = [selected] if selected is not None else self.cfg.accounts
+            for name in names:
+                ac = self.cfg.accounts[name]
+                lines.extend(["", self._account_label(name)])
+                cached = self._bill_cache.get(name)
+                reuse = cached is not None and (
+                    cached.attempted_mono >= requested_at
+                    or (not force and time.monotonic() - cached.attempted_mono < self.BILL_REUSE_SEC)
+                )
+                if not reuse:
+                    account = billing.BillingAccount(
+                        name, self._account_label(name), ac.access_key_id, ac.access_key_secret,
+                    )
+                    error = ""
+                    summary = products = None
+                    try:
+                        rows = billing.query_overview(account, month)
+                        summary = billing.format_overview(rows, include_products=False)
+                        products = billing.format_overview(rows)
+                    except billing.BillingError as exc:
+                        error = str(exc)
+                    except Exception:
+                        # SDK 异常可能含凭据；不记录原始异常或错误响应。
+                        error = "发生未预期错误，请稍后重试。"
+                    stamp = datetime.now(billing.BILL_TZ).strftime("%Y-%m-%d %H:%M:%S UTC+8")
+                    cached = BillSnapshot(
+                        summary=cached.summary if error and cached else summary,
+                        products=cached.products if error and cached else products,
+                        queried_at=(cached.queried_at if cached else None) if error else stamp,
+                        attempted_at=stamp, attempted_mono=time.monotonic(), error=error,
+                    )
+                    # 跨月完成的旧账期结果可以返回，但不得留在本月缓存。
+                    if datetime.now(billing.BILL_TZ).strftime("%Y-%m") == month:
+                        self._bill_cache[name] = cached
+                    else:
+                        self._bill_cache.clear()
+                if cached.error:
+                    lines.append(f"  查询失败，当前金额未知：{cached.error}")
+                    lines.append(f"  最近尝试：{cached.attempted_at}")
+                    if cached.queried_at is not None:
+                        lines.append(f"  ⚠️ 以下为旧数据，上次成功查询：{cached.queried_at}")
+                elif reuse:
+                    lines.append(f"  缓存数据 · 查询时间：{cached.queried_at}")
+                else:
+                    lines.append(f"  查询时间：{cached.queried_at}")
+                content = cached.products if selected is not None else cached.summary
+                if content is not None:
+                    lines.append(content)
+            lines.extend([
+                "", "账户级税前费用，非单台 ECS 成本；不同币种及账单类型分别列示。",
+                "账单有延迟，当月金额未最终确认；暂无条目不代表没有费用。",
+                "查询时间不是计费数据截止时间。",
+            ])
+            return "\n".join(lines)
+
+    def _request_bill(self, selected: Optional[str]) -> None:
+        if not self.cfg.billing.enabled:
+            return
+
+        def run() -> None:
+            while True:
+                with self._bill_command_lock:
+                    if not self._bill_requests:
+                        self._bill_running = False
+                        return
+                    # 全账户查询优先，使其他详情视图复用同一轮数据。
+                    target = None if None in self._bill_requests else next(iter(self._bill_requests))
+                try:
+                    self.tg.send(self._billing_report_text(target))
+                except Exception:
+                    try:
+                        self.tg.send("⚠️ 账单查询未完成，金额未知，请稍后重试。")
+                    except Exception:
+                        LOGGER.warning("账单报告未能进入发送队列")
+                finally:
+                    with self._bill_command_lock:
+                        self._bill_requests.discard(target)
+
+        with self._bill_command_lock:
+            self._bill_requests.add(selected)
+            if self._bill_running:
+                self.tg.send("💰 已有账单查询正在进行，已合并请求，完成后会发送所需报告。")
+                return
+            self.tg.send("💰 正在查询本月账单，五分钟内重复查询会复用最近结果。")
+            self._bill_running = True
+            try:
+                self._bill_thread = threading.Thread(target=run, name="billing-query", daemon=True)
+                self._bill_thread.start()
+            except Exception:
+                self._bill_running = False
+                self._bill_requests.clear()
+                raise
 
     def maintenance_job(self) -> None:
         """每日清理历史记录，限制长期数据库增长。"""
@@ -1365,6 +1516,14 @@ class Rotator:
         arg = parts[1] if len(parts) > 1 else ""
         if c == "check":
             self._tg_check()
+        elif c == "bill" and self.cfg.billing.enabled:
+            if len(parts) > 2 or (arg and arg not in self.cfg.accounts):
+                self.tg.send(
+                    "用法：/bill 查看全部账户；/bill 账号键 展开产品费用。\n"
+                    f"可用账户：{self._account_labels(self.cfg.accounts)}"
+                )
+                return
+            self._request_bill(arg or None)
         elif c == "traffic":
             if not self.submit_intent("TRAFFIC_REFRESH"):
                 self.tg.send("⚠️ 系统请求较多，请稍后重试。")
@@ -1409,11 +1568,16 @@ class Rotator:
                 "系统将检查流量和运行额度，并选择符合条件的节点恢复服务。"
             )
         else:
+            bill_help = (
+                "• /bill [账号键] — 本月账单，指定账户展开产品费用\n"
+                if self.cfg.billing.enabled else ""
+            )
             self.tg.send(
                 "❓ 无法识别这条命令\n\n"
                 "可用命令：\n"
                 "• /check — 查看完整运行报告\n"
                 "• /traffic — 刷新本月流量\n"
+                f"{bill_help}"
                 "• /switch [账号键] — 切换节点\n"
                 "• /breaker confirm — 全部保护停机\n"
                 "• /resume — 恢复服务\n"
@@ -2364,11 +2528,15 @@ class Rotator:
         return self.sj.load().get("duty_account")
 
     def _account_label(self, account: Optional[str]) -> str:
-        """TG 使用 ECS 友好名，方括号保留稳定账号键供 /switch 使用。"""
+        """TG 优先使用配置友好名，方括号保留 /switch 和 /bill 的账号键。"""
         if account is None:
             return "无"
-        friendly = self._instance_names.get(account) or account
-        return f"{friendly} [{account}]" if friendly != account else account
+        ac = self.cfg.accounts.get(account)
+        friendly = billing.display(
+            (ac.instance_name if ac else "") or self._instance_names.get(account) or account
+        )
+        key = billing.display(account)
+        return f"{friendly} [{key}]" if friendly != key else key
 
     def _account_labels(self, accounts) -> str:
         return ", ".join(self._account_label(a) for a in accounts)
@@ -2657,8 +2825,8 @@ class Rotator:
         if legacy_start:
             frm, to, reason = legacy_start.groups()
             return (
-                f"原节点：{frm}\n"
-                f"目标节点：{to}\n"
+                f"原节点：{self._account_label(None if frm == 'None' else frm)}\n"
+                f"目标节点：{self._account_label(None if to == 'None' else to)}\n"
                 f"触发原因：{self._reason_label(reason)}"
             )
         result = re.sub(
@@ -2777,7 +2945,7 @@ def _run(cfg: Config) -> None:
                       coalesce=True, max_instances=1, id="maintenance")
 
     # TG 命令菜单 + 长轮询（回调只入队/只读）
-    tg.register_commands()
+    tg.register_commands(billing_enabled=cfg.billing.enabled)
     tg.start_polling(rotator.handle_tg_command)
 
     # 可选 webhook（默认关，EXPERIMENTAL）：POST 匹配 instance_id -> 入队 EV_SPOT_WARN
