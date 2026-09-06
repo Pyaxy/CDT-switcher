@@ -2,13 +2,15 @@
 # 所有 thresholds 字段均可省略（用默认值），也可被同名环境变量覆盖（见各字段注释）
 
 accounts:
-  # 账号 A（阿里云国际站，RAM 子账号 AK，权限：ECS 启停/查询 + cdt:ListCdtInternetTraffic，限定实例 ARN）
+  # 账号 A：阿里云国际站 RAM 用户凭据；ECS 启停/查询权限按实例限定。
+  # CDT 需要 cdt:ListCdtInternetTraffic；可选账单权限见下方 billing 配置。
   A:
     region: cn-hongkong
     access_key_id: "YOUR_ACCOUNT_A_ACCESS_KEY_ID"
     access_key_secret: "YOUR_ACCOUNT_A_ACCESS_KEY_SECRET"
     instance_id: "YOUR_ACCOUNT_A_INSTANCE_ID"
-    instance_name: "节点 A"        # 可选；通知、账单优先显示它，省略则主程序读取 ECS InstanceName
+    instance_name: "节点 A"        # 可选友好名称；通知和账单显示为“节点 A [A]”
+    # 未配置 instance_name 时采用已观测到的 ECS InstanceName；未取得名称时回退到账号键。
     eip: "203.0.113.10"            # 文档示例地址；替换成该账号绑定的 EIP
     service_port: 31227            # T3 对 EIP:此端口做 TCP 探测，填写实际要检查的服务端口
     # ecs_endpoint: ""             # 可选，默认 ecs.<region>.aliyuncs.com
@@ -27,9 +29,16 @@ telegram:
   bot_token: "YOUR_TELEGRAM_BOT_TOKEN"
   chat_ids: [123456789]            # 示例 ID；替换成授权用户或群组 ID
 
+# 可选账户账单查询。billing 与 accounts、telegram、thresholds 同为顶层配置。
 billing:
-  enabled: false                  # 显式设为 true 才启用 /bill 和每日费用汇总；省略默认关闭
-  # 复用各账户 AK；额外只读权限 bss:DescribeBillList，见 docs/billing.md。
+  enabled: false                  # YAML 布尔值；省略默认 false，修改后需重启主程序
+  # true：启用 /bill、/bill 账号键，以及每日 23:58（UTC+8）的本月费用汇总。
+  # false：不注册账单命令、不查询账单，每日运行报告保留原有内容。
+  # 复用 accounts 中各账户的 RAM 用户凭据，需增加 bss:DescribeBillList 只读权限。
+  # 查询范围为凭据所属账户；金额为税前账单费用，不参与实例调度或额度保护。
+  # 手动查询五分钟内复用最近结果；仅保留当月内存缓存，不持久化原始账单。
+  # 当前仅支持 enabled 字段；缓存时长和每日报告时间不可通过 billing 配置调整。
+  # 完整配置、授权策略与验证步骤：docs/billing.md。
 
 thresholds:                        # 全部可选；环境变量优先级更高
   patrol_interval_sec: 60          # PATROL_INTERVAL

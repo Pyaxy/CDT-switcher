@@ -396,6 +396,12 @@ journalctl -u cdt-switcher -n 80 --no-pager
 
 git pull 不会携带旧本地配置来覆盖生产状态。若本次更新了 service 文件，需按第 7 节重新安装 unit 并 daemon-reload，保留自己的 override.conf。
 
+### 启用账户账单查询
+
+账单功能默认关闭，已有部署更新代码后仍保持原有运行行为。启用前，需为各账户配置的 RAM 用户增加 `bss:DescribeBillList` 只读权限，并在 `config.yaml` 顶层设置 `billing.enabled: true`。配置变更通过重启 `cdt-switcher` 生效；仅修改应用配置不需要 `systemctl daemon-reload`。
+
+启用后可通过 `/bill` 查询全部账户本月费用，或通过 `/bill 账号键` 展开单账户产品费用。每日 23:58（UTC+8）的运行报告会附加本月费用。完整配置、独立终端验证及故障排查见[账单查询配置指南](billing.md)。
+
 ### 停机备份
 
 只在 systemctl stop 已完成、没有其他控制进程时执行。备份包含密钥，必须私有保存：
