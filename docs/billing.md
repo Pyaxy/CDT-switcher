@@ -2,7 +2,7 @@
 
 账单功能用于查询阿里云国际站账户的月度税前费用。主程序通过 Telegram 提供本月账单查询，并在每日运行报告中附加各账户费用；`billing_query.py` 提供独立终端入口，用于授权验证、金额核对和历史月份查询。
 
-查询接口为 `QueryBillOverview`，统计范围为 AccessKey 所属账户，而非 `accounts` 中配置的单台 ECS。账单金额和查询结果不参与流量阈值判断、目标节点选择、实例启停或全局保护停机。
+查询接口为 `QueryBillOverview`，统计范围为 AccessKey 所属账户。账单用于费用展示，独立于流量保护和实例调度。账户创建及基础权限见[控制台准备与最小权限](permissions.md)。
 
 ## 1. 配置字段
 
@@ -18,17 +18,17 @@ billing:
 | `billing.enabled` | YAML 布尔值 | `false` | 启用 Telegram 账单命令和每日费用汇总；修改后需重启主程序。 |
 | `accounts.<账号键>.instance_name` | 字符串，可选 | 空 | 账户在通知和账单中的友好名称，例如 `香港节点 [A]`。 |
 
-省略 `billing`、省略 `enabled` 或设置 `enabled: false` 时，主程序不发起账单请求，机器人菜单和帮助不显示 `/bill`，每日运行报告保留原有内容。字符串 `"true"`、`"false"` 及数字不属于该开关接受的类型。
+省略 `billing`、省略 `enabled` 或设置 `enabled: false` 时，主程序不发起账单请求，机器人菜单和帮助不显示 `/bill`，每日报告仅包含运行状态和用量。开关值使用 YAML 布尔类型。
 
-当前 `billing` 仅支持 `enabled` 字段。缓存复用窗口固定为 300 秒，每日报告时间固定为 23:58（UTC+8）；不支持通过该配置节调整时间、账单接入点或历史月份保留数量。
+billing 配置包含 `enabled` 开关。缓存复用窗口固定为 300 秒，每日报告时间固定为 23:58（UTC+8）。
 
-账单功能复用 `accounts` 中已有的 `access_key_id`、`access_key_secret`，无需单独配置凭据或安装额外依赖。所有已配置账户均纳入 `/bill` 和每日费用汇总，不提供逐账户启用开关。
+账单功能复用 `accounts` 中的 `access_key_id`、`access_key_secret`，依赖包含在项目的 `requirements.txt` 中。开关统一作用于全部配置账户。
 
-`instance_name` 不改变账号键。命令参数使用 `accounts` 下的键，例如 `/bill A`；未配置友好名称时，主程序采用已观测到的 ECS `InstanceName`，尚未取得名称时回退到账号键。
+命令参数使用 `accounts` 下的账号键，例如 `/bill A`。显示名称优先采用 `instance_name`，其次为已观测到的 ECS `InstanceName`，尚未取得名称时使用账号键。
 
 ## 2. RAM 授权
 
-为每个需要查询的 RAM 用户增加以下自定义只读策略，保留原有 ECS/CDT 权限：
+为每个需要查询的 RAM 用户附加以下自定义只读策略。控制台创建和绑定步骤见[权限指南](permissions.md#5-可选账单权限)：
 
 ```json
 {
@@ -43,7 +43,7 @@ billing:
 }
 ```
 
-该接口对应的 RAM Action 为 `bss:DescribeBillList`，与接口名 `QueryBillOverview` 不同。查询采用账户级授权，策略中的 `Resource` 使用 `*`，不能替换为 ECS 实例 ARN。此功能不要求支付、购买或实例账单明细权限。参考 [QueryBillOverview 官方文档](https://www.alibabacloud.com/help/en/user-center/developer-reference/api-bssopenapi-2017-12-14-querybilloverview)。
+`QueryBillOverview` 对应的 RAM Action 为 `bss:DescribeBillList`，采用账户级授权，`Resource` 使用 `*`。这一动作即可满足账单模块的 API 权限要求。参考 [QueryBillOverview 官方文档](https://www.alibabacloud.com/help/en/user-center/developer-reference/api-bssopenapi-2017-12-14-querybilloverview)。
 
 使用 RAM 用户凭据，不使用主账户 AccessKey。真实凭据仅保存在受保护的配置文件中，不写入命令参数或版本库。
 
@@ -51,7 +51,7 @@ billing:
 
 ### 3.1 验证单账户查询
 
-完成 RAM 授权后，在项目目录使用已有虚拟环境执行：
+完成 RAM 授权后，在项目目录使用虚拟环境执行。按[部署指南](deploy.md)使用服务用户安装时，在以下命令前添加 `runuser -u cdt-switcher --`：
 
 ```bash
 .venv/bin/python billing_query.py --config config.yaml --account A
@@ -59,7 +59,7 @@ billing:
 
 将 `A` 替换为实际账号键，在费用控制台选择相同账户和月份，核对产品分类及税前金额。
 
-独立终端入口不受 `billing.enabled` 控制，可在主程序账单功能关闭时执行。它不启动状态机、Telegram 轮询或调度器，不操作 ECS/CDT，也不读写运行状态、数据库、运行锁或账单缓存，可与已有控制器并行运行。
+独立终端入口只读取账户配置并查询账单，可与控制器并行执行，不受 `billing.enabled` 控制，也不写入运行数据。
 
 ### 3.2 应用配置
 
@@ -85,7 +85,7 @@ journalctl -u cdt-switcher -n 50 --no-pager
 
 Telegram 入口仅支持本月查询，不接受月份或强制刷新参数。历史月份查询使用独立终端入口。
 
-命令立即返回查询提示，结果沿用现有通知机制，发送至全部已配置的授权聊天，而非仅回复命令发起者。账户显示为友好名称及账号键；长报告自动分段发送。
+命令立即返回查询提示，查询结果发送至全部已配置的授权聊天。账户显示为友好名称及账号键；长报告自动分段发送。
 
 ## 4. 查询、缓存与失败语义
 
@@ -168,7 +168,7 @@ Telegram 入口仅支持本月查询，不接受月份或强制刷新参数。�
 | 配置加载提示 `billing.enabled` 类型错误 | 使用不带引号的 `true` 或 `false`，不使用字符串、数字或空值。 |
 | 提示账号键无效 | 使用 `accounts` 下的实际键，不使用 `instance_name` 或 ECS 实例 ID；可通过 `/check` 核对节点名称。 |
 | 返回权限错误 | 检查对应 AccessKey 所属 RAM 用户是否具有 `bss:DescribeBillList` 的账户级只读权限，并用终端入口单独验证。 |
-| 短时间修改权限后仍显示之前的失败 | 手动查询可能复用五分钟内的失败结果；等待复用窗口结束，或使用独立终端入口立即验证。 |
+| 重复查询返回相同失败状态 | 手动查询复用五分钟内的失败结果；等待复用窗口结束，或使用独立终端入口验证。 |
 | 报告显示旧数据 | 本轮刷新失败；按上次成功查询时间判断数据时效，排查失败原因后重新查询。 |
 | 金额与单台 ECS 的估算费用不一致 | 本功能查询账户级账单，应按相同账户、月份、币种和账单类型核对费用控制台。 |
 

@@ -1,21 +1,20 @@
-# cdt_switcher 配置模板 —— 复制为 config.yaml 后填写（config.yaml 已被 .gitignore 排除，绝不提交）
-# 所有 thresholds 字段均可省略（用默认值），也可被同名环境变量覆盖（见各字段注释）
+# CDT-switcher 配置示例。复制为 config.yaml，并替换 YOUR_* 和文档示例地址。
+# 控制台及 RAM 授权：docs/permissions.md；部署流程：docs/deploy.md。
+# config.yaml 包含访问凭据，应仅允许服务用户和管理员读取。
 
+# 每个账号键对应一组账户凭据和一台 ECS；账号键用于命令及本地历史记录。
 accounts:
-  # 账号 A：阿里云国际站 RAM 用户凭据；ECS 启停/查询权限按实例限定。
-  # CDT 需要 cdt:ListCdtInternetTraffic；可选账单权限见下方 billing 配置。
   A:
     region: cn-hongkong
     access_key_id: "YOUR_ACCOUNT_A_ACCESS_KEY_ID"
     access_key_secret: "YOUR_ACCOUNT_A_ACCESS_KEY_SECRET"
     instance_id: "YOUR_ACCOUNT_A_INSTANCE_ID"
-    instance_name: "节点 A"        # 可选友好名称；通知和账单显示为“节点 A [A]”
-    # 未配置 instance_name 时采用已观测到的 ECS InstanceName；未取得名称时回退到账号键。
-    eip: "203.0.113.10"            # 文档示例地址；替换成该账号绑定的 EIP
-    service_port: 31227            # T3 对 EIP:此端口做 TCP 探测，填写实际要检查的服务端口
-    # ecs_endpoint: ""             # 可选，默认 ecs.<region>.aliyuncs.com
+    instance_name: "节点 A"        # 可选显示名；通知中显示为“节点 A [A]”
+    eip: "203.0.113.10"            # 实例预期公网地址，支持 EIP 或实例公网 IP
+    service_port: 31227            # 控制机连接的公网 TCP 业务端口
+    # 未设置 instance_name 时使用观测到的 ECS InstanceName，未取得名称时使用账号键。
+    # ecs_endpoint: ""             # 可选接入点，默认 ecs.<region>.aliyuncs.com
     # cdt_endpoint: "cdt.aliyuncs.com"
-  # 账号 B
   B:
     region: cn-hongkong
     access_key_id: "YOUR_ACCOUNT_B_ACCESS_KEY_ID"
@@ -27,38 +26,48 @@ accounts:
 
 telegram:
   bot_token: "YOUR_TELEGRAM_BOT_TOKEN"
-  chat_ids: [123456789]            # 示例 ID；替换成授权用户或群组 ID
+  chat_ids: [123456789]            # 数字聊天 ID 列表；群组 ID 可为负数
+  # 授权范围为整个聊天。授权群组中可发送命令的成员均可触发控制操作。
+  # 运行报告和通知发送到全部授权聊天。
 
-# 可选账户账单查询。billing 与 accounts、telegram、thresholds 同为顶层配置。
+# 可选账单查询，复用账户凭据；需额外授权 bss:DescribeBillList。
+# 配置和金额口径：docs/billing.md。
 billing:
-  enabled: false                  # YAML 布尔值；省略默认 false，修改后需重启主程序
-  # true：启用 /bill、/bill 账号键，以及每日 23:58（UTC+8）的本月费用汇总。
-  # false：不注册账单命令、不查询账单，每日运行报告保留原有内容。
-  # 复用 accounts 中各账户的 RAM 用户凭据，需增加 bss:DescribeBillList 只读权限。
-  # 查询范围为凭据所属账户；金额为税前账单费用，不参与实例调度或额度保护。
-  # 手动查询五分钟内复用最近结果；仅保留当月内存缓存，不持久化原始账单。
-  # 当前仅支持 enabled 字段；缓存时长和每日报告时间不可通过 billing 配置调整。
-  # 完整配置、授权策略与验证步骤：docs/billing.md。
+  enabled: false                  # YAML 布尔值；默认关闭，修改后重启主程序
+  # 开启后注册 /bill、/bill 账号键，并在每日 23:58（UTC+8）报告中增加本月费用。
+  # 手动查询复用窗口固定为 300 秒，缓存仅保留当月内存汇总。
 
-thresholds:                        # 全部可选；环境变量优先级更高
-  patrol_interval_sec: 60          # PATROL_INTERVAL
-  traffic_interval_min: 20         # TRAFFIC_INTERVAL
-  traffic_threshold_gb: 188        # TRAFFIC_THRESHOLD_GB（对 200GB 非内地额度，含 12GB 延迟缓冲）
-  tmax_hours: 360                  # TMAX_HOURS（均衡手段；流量通常先撞线）
-  start_timeout_sec: 600           # START_TIMEOUT
-  probe_interval_sec: 5            # T3 每次 TCP 探测的间隔
-  probe_required_success: 3        # T3 连续成功次数；未满足前绝不停旧机
-  probe_timeout_sec: 240           # PROBE_TIMEOUT，超时则停新机并回滚
-  stop_timeout_sec: 600            # STOP_TIMEOUT
-  stop_retry_interval_sec: 300     # STOP_RETRY_INTERVAL
-  stop_alarm_interval_sec: 1800    # STOP_ALARM_INTERVAL
-  alert_repeat_interval_sec: 1800  # ALERT_REPEAT_INTERVAL；同类 TG 告警最短重复间隔
-  traffic_stale_sec: 3600          # TRAFFIC_STALE；超过此时间的流量快照不得参与选机
-  traffic_retention_days: 180      # TRAFFIC_RETENTION_DAYS；每日自动清理更旧的流量快照
-  event_retention_days: 180        # EVENT_RETENTION_DAYS；每日自动清理更旧的事件
-  runtime_retention_months: 24     # RUNTIME_RETENTION_MONTHS；保留最近月份的运行时长
-  auto_switch_on_service_down: false   # AUTO_SWITCH_ON_SERVICE_DOWN（默认只告警不切换）
-  enable_eventbridge_webhook: false    # ENABLE_EVENTBRIDGE_WEBHOOK（EXPERIMENTAL，需安全隧道或反向代理暴露）
-  webhook_listen: "127.0.0.1:8787"
-  db_path: "rotator.db"            # DB_PATH
-  state_path: "state.json"         # STATE_PATH
+# 以下字段均可省略。注明 ENV 的字段支持对应环境变量覆盖，环境变量优先。
+thresholds:
+  # 调度与流量
+  patrol_interval_sec: 60          # 常规巡检及记账周期；ENV: PATROL_INTERVAL
+  traffic_interval_min: 20         # CDT 刷新周期；ENV: TRAFFIC_INTERVAL
+  traffic_threshold_gb: 188        # 非内地流量阈值；ENV: TRAFFIC_THRESHOLD_GB
+  # 流量数值按字节 / 1024^3 换算；根据实际账户额度、计量单位和查询延迟设置余量。
+  tmax_hours: 360                  # 每账户本月运行时长阈值；ENV: TMAX_HOURS
+
+  # 启动、服务探测与停机
+  start_timeout_sec: 600           # 目标启动等待超时；ENV: START_TIMEOUT
+  nostock_backoff_sec: [60, 120, 240, 480]  # 库存不足退避序列，后续使用末项
+  probe_interval_sec: 5            # 服务探测间隔及快速控制周期；ENV: PROBE_INTERVAL
+  probe_required_success: 3        # 进入停机阶段所需连续探测成功数；ENV: PROBE_REQUIRED_SUCCESS
+  probe_timeout_sec: 240           # 服务检查超时；ENV: PROBE_TIMEOUT
+  stop_timeout_sec: 600            # 停机确认超时告警阈值；ENV: STOP_TIMEOUT
+  stop_retry_interval_sec: 300     # 停机请求重试间隔；ENV: STOP_RETRY_INTERVAL
+  stop_alarm_interval_sec: 1800    # 停机异常重复告警间隔；ENV: STOP_ALARM_INTERVAL
+  alert_repeat_interval_sec: 1800  # 同类告警最短重复间隔；ENV: ALERT_REPEAT_INTERVAL
+
+  # 数据有效期与历史清理
+  traffic_stale_sec: 3600          # 候选选择接受的快照最大年龄；ENV: TRAFFIC_STALE
+  traffic_retention_days: 180      # 流量记录保留天数；ENV: TRAFFIC_RETENTION_DAYS
+  event_retention_days: 180        # 事件记录保留天数；ENV: EVENT_RETENTION_DAYS
+  runtime_retention_months: 24     # 历史运行月份清理窗口；ENV: RUNTIME_RETENTION_MONTHS
+
+  # 可选控制入口
+  auto_switch_on_service_down: false   # 服务连续探测失败时自动切换；ENV: AUTO_SWITCH_ON_SERVICE_DOWN
+  enable_eventbridge_webhook: false    # 实验性回收事件入口；ENV: ENABLE_EVENTBRIDGE_WEBHOOK
+  webhook_listen: "127.0.0.1:8787"      # 启用时由部署者配置来源认证和受限访问
+
+  # 相对路径以进程工作目录为基准；systemd 默认目录为 /opt/cdt-switcher。
+  db_path: "rotator.db"            # SQLite 数据库；ENV: DB_PATH
+  state_path: "state.json"         # 切换进度和保护意图；ENV: STATE_PATH

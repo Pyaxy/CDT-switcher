@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# 部署在第三方常开设备（绝不跑在被管 ECS 上）
+# 服务部署于独立控制机，使用专用本地用户。
 User=cdt-switcher
 Group=cdt-switcher
 UMask=0077
@@ -19,7 +19,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 LogRateLimitIntervalSec=60s
 LogRateLimitBurst=300
-# 崩溃即拉起；首轮 reconcile 只读，游标幂等续跑
+# 进程异常退出后由 systemd 重启，启动频率受系统服务管理策略约束。
 
 [Install]
 WantedBy=multi-user.target
