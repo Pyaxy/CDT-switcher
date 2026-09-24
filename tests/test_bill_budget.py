@@ -237,6 +237,44 @@ class BillBudgetTests(unittest.TestCase):
                 with self.subTest(section=section), self.assertRaises(ValueError):
                     load(section)
 
+    def test_exceeded_alert_is_once_per_month_across_refresh_and_restart(self):
+        r, f, s, j, tg = self.world()
+        s.record_bill_budget("A", m.current_month(), Decimal("10"))
+        r._bill_budget_alerts()
+        self.assertEqual(len(tg.messages), 1)
+        for amount in (Decimal("12"), Decimal("2"), None):
+            s.record_bill_budget("A", m.current_month(), amount)
+            r._notification_last.clear()  # 不依赖原来的半小时节流窗口。
+            r._bill_budget_alerts()
+        database = s._conn.execute("PRAGMA database_list").fetchone()[2]
+        reopened = m.StateStore(database)
+        self.addCleanup(reopened.close)
+        restarted = m.Rotator(r.cfg, reopened, j, tg)
+        restarted._bill_budget_alerts()
+        self.assertEqual(len(tg.messages), 1)
+        self.assertIn("本月最高已知 USD 12", restarted._summary_text("状态"))
+        with patch.object(b, "query_overview", return_value=rows()):
+            restarted.daily_report()
+        self.assertEqual(len(tg.messages), 2)
+        self.assertIn("每日运行报告", tg.messages[-1])
+        self.assertIn("本月最高已知 USD 12", tg.messages[-1])
+
+    def test_exceeded_alert_is_independent_per_account_and_new_month(self):
+        r, f, s, j, tg = self.world()
+        for a in ("A", "B"):
+            s.record_bill_budget(a, m.current_month(), Decimal("10"))
+        r._bill_budget_alerts()
+        self.assertEqual(len(tg.messages), 2)
+        r._bill_budget_alerts()
+        self.assertEqual(len(tg.messages), 2)
+        with patch.object(m, "current_month", return_value="2099-01"):
+            for a in f:
+                s.record_bill_budget(a, "2099-01", Decimal("10") if a == "A" else Decimal("1"))
+            r._bill_budget_alerts()
+            self.assertEqual(len(tg.messages), 3)
+            r._bill_budget_alerts()
+            self.assertEqual(len(tg.messages), 3)
+
 
 if __name__ == "__main__":
     unittest.main()

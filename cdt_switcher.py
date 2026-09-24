@@ -787,6 +787,11 @@ class StateStore:
             )
             # 旧数据库原地迁移；按账号取最大 id，避免历史增长后相关子查询平方退化。
             self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS bill_budget_alerts ("
+                "account TEXT NOT NULL, month TEXT NOT NULL, ts TEXT NOT NULL, "
+                "PRIMARY KEY (account, month))"
+            )
+            self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_traffic_account_id "
                 "ON traffic_snapshots(account, id DESC)"
             )
@@ -915,6 +920,18 @@ class StateStore:
             Decimal(row[0]) if row[0] is not None else None,
             Decimal(row[1]) if row[1] is not None else None, *row[2:])
 
+    def claim_bill_budget_alert(self, account: str, month: str) -> bool:
+        """每账号每月只认领一次超额通知；独立于可刷新的预算快照。"""
+        with self._lock:
+            if month != current_month():
+                return False
+            cursor = self._conn.execute(
+                "INSERT OR IGNORE INTO bill_budget_alerts (account, month, ts) VALUES (?, ?, ?)",
+                (account, month, now_iso()),
+            )
+            self._conn.commit()
+            return cursor.rowcount == 1
+
     def log_event(self, kind: str, message: str) -> None:
         """记录调度 / 熔断 / 抢占 / 恢复 / 告警流水，供 /last 与每日汇总。"""
         with self._lock:
@@ -953,6 +970,9 @@ class StateStore:
             )
             b_cur = self._conn.execute(
                 "DELETE FROM bill_budget WHERE month < ?", (runtime_cutoff,)
+            )
+            self._conn.execute(
+                "DELETE FROM bill_budget_alerts WHERE month < ?", (runtime_cutoff,)
             )
             self._conn.commit()
             self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
@@ -2683,15 +2703,22 @@ class Rotator:
         if not self._bill_guard_enabled():
             return
         for account in self.cfg.accounts:
+            month = current_month()
             status, _ = self._bill_budget_status(account)
-            if status in ("unknown", "exceeded"):
+            if status == "exceeded":
+                if self.store.claim_bill_budget_alert(account, month):
+                    self._notify(
+                        "切换异常",
+                        f"节点 {self._account_label(account)}\n{self._bill_budget_text(account)}\n"
+                        "当班节点将按现有流程切换，无候选时执行保护停机。\n"
+                        "本账号本月超额仅通知一次，后续状态请查看每日总结或 /check。",
+                    )
+            elif status == "unknown":
                 self._notify_throttled(
                     f"bill-budget:{account}:{status}",
                     self.cfg.th.alert_repeat_interval_sec, "切换异常",
                     f"节点 {self._account_label(account)}\n{self._bill_budget_text(account)}\n"
-                    + ("当班节点将按现有流程切换，无候选时执行保护停机。"
-                       if status == "exceeded" else
-                       "不会仅因账单未知停止正常当班节点；请检查账单查询。"),
+                    "不会仅因账单未知停止正常当班节点；请检查账单查询。",
                 )
 
     def _pick_candidate(self, candidates: list[str], runtimes: dict) -> Optional[str]:
