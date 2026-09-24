@@ -153,6 +153,20 @@ def query_overview(account: BillingAccount, month: str) -> list[BillRow]:
     return result
 
 
+def budget_amount_usd(rows: list[BillRow]) -> Decimal:
+    """预算保护口径：USD 正向费用，退款与负向金额不抵扣。空账单不等于零。"""
+    if not rows:
+        raise BillingError("暂无账单条目，保护金额未知")
+    if any(row.currency != "USD" for row in rows):
+        raise BillingError("账单包含非 USD 币种，无法用于美元阈值保护")
+    if any(row.kind not in BILL_TYPES or not row.pretax.is_finite() for row in rows):
+        raise BillingError("账单类型或金额无效，保护金额未知")
+    charges = [row for row in rows if row.kind != "Refund"]
+    if not charges:
+        raise BillingError("仅有退款条目，保护金额未知")
+    return sum((max(row.pretax, Decimal(0)) for row in charges), Decimal(0))
+
+
 def format_overview(rows: list[BillRow], *, include_products: bool = True) -> str:
     if not rows:
         return "  本月接口暂无账单条目（不代表未产生费用）。"

@@ -7,6 +7,7 @@ from __future__ import annotations
 import copy, fcntl, json, logging, math, os, queue, re, signal, socket, sqlite3, sys, threading, time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable, Optional
@@ -89,6 +90,7 @@ _REASON_UI = {
     "manual": "手动切换",
     "traffic": "本月流量达到保护阈值",
     "tmax": "本月运行时长达到上限",
+    "bill_budget": "本月账单达到保护阈值",
     "spot_warn": "收到抢占或回收预警",
     "service_down": "服务连续探测失败",
     "month_reset": "月度额度重置后恢复",
@@ -194,6 +196,9 @@ class Thresholds:
 @dataclass
 class BillingCfg:
     enabled: bool = False
+    threshold_usd: Optional[Decimal] = None  # null 默认关闭停机保护；每账号统一阈值
+    refresh_interval_min: int = 60
+    stale_sec: int = 10800
 
 
 @dataclass
@@ -209,6 +214,15 @@ class BillSnapshot:
     attempted_at: str
     attempted_mono: float
     error: str = ""
+
+
+@dataclass(frozen=True)
+class BillBudgetSnapshot:
+    amount: Optional[Decimal]
+    highwater: Optional[Decimal]
+    queried_at: Optional[str]
+    attempted_at: str
+    error: str
 
 
 @dataclass
@@ -410,13 +424,31 @@ def load_config(path: str = "config.yaml") -> Config:
     enabled = billing_raw.get("enabled", False)
     if not isinstance(enabled, bool):
         raise ValueError("billing.enabled 必须是布尔值 true 或 false")
+    bill_cfg = BillingCfg(enabled=enabled)
+    raw_threshold = billing_raw.get("threshold_usd")
+    if raw_threshold is not None:
+        try:
+            bill_cfg.threshold_usd = Decimal(str(raw_threshold))
+        except (InvalidOperation, ValueError) as exc:
+            raise ValueError("billing.threshold_usd 必须为正数或 null") from exc
+        if not bill_cfg.threshold_usd.is_finite() or bill_cfg.threshold_usd <= 0:
+            raise ValueError("billing.threshold_usd 必须为正数或 null")
+        if not enabled:
+            raise ValueError("设置 billing.threshold_usd 时必须启用 billing.enabled")
+    for key in ("refresh_interval_min", "stale_sec"):
+        value = billing_raw.get(key, getattr(bill_cfg, key))
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"billing.{key} 必须为正整数")
+        setattr(bill_cfg, key, value)
+    if bill_cfg.stale_sec < bill_cfg.refresh_interval_min * 60:
+        raise ValueError("billing.stale_sec 不能小于账单刷新间隔")
     scheduling_raw = data.get("scheduling", {})
     if not isinstance(scheduling_raw, dict):
         raise ValueError("scheduling 必须是对象")
     strategy = scheduling_raw.get("strategy", "balanced")
     if strategy not in ("balanced", "priority"):
         raise ValueError("scheduling.strategy 必须是 balanced 或 priority")
-    return Config(accounts=accounts, tg=tg, th=th, billing=BillingCfg(enabled=enabled),
+    return Config(accounts=accounts, tg=tg, th=th, billing=bill_cfg,
                   scheduling=SchedulingCfg(strategy=strategy))
 
 
@@ -747,6 +779,12 @@ class StateStore:
                 "id INTEGER PRIMARY KEY AUTOINCREMENT, "
                 "ts TEXT NOT NULL, account TEXT NOT NULL, gb REAL NOT NULL)"
             )
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS bill_budget ("
+                "account TEXT NOT NULL, month TEXT NOT NULL, amount TEXT, highwater TEXT, "
+                "queried_at TEXT, attempted_at TEXT NOT NULL, error TEXT NOT NULL, "
+                "PRIMARY KEY (account, month))"
+            )
             # 旧数据库原地迁移；按账号取最大 id，避免历史增长后相关子查询平方退化。
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_traffic_account_id "
@@ -839,6 +877,44 @@ class StateStore:
                 fresh[acc] = gb
         return fresh
 
+    def record_bill_budget(self, account: str, month: str,
+                           amount: Optional[Decimal], error: str = "") -> None:
+        """保存本次状态及同月最高已知费用；失败不清除历史超额证据。"""
+        stamp = now_iso()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT amount, highwater, queried_at FROM bill_budget "
+                "WHERE account = ? AND month = ?", (account, month),
+            ).fetchone()
+            old_amount, highwater, queried_at = row or (None, None, None)
+            if amount is not None and not error:
+                if not amount.is_finite() or amount < 0:
+                    raise ValueError("无效账单保护金额")
+                highwater = str(max(amount, Decimal(highwater))) if highwater is not None else str(amount)
+                old_amount, queried_at = str(amount), stamp
+            else:
+                error = error or "保护金额未知"
+            self._conn.execute(
+                "INSERT OR REPLACE INTO bill_budget "
+                "(account, month, amount, highwater, queried_at, attempted_at, error) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (account, month, old_amount, highwater, queried_at, stamp, error),
+            )
+            self._conn.commit()
+
+    def get_bill_budget(self, account: str) -> Optional[BillBudgetSnapshot]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT amount, highwater, queried_at, attempted_at, error "
+                "FROM bill_budget WHERE account = ? AND month = ?",
+                (account, current_month()),
+            ).fetchone()
+        if row is None:
+            return None
+        return BillBudgetSnapshot(
+            Decimal(row[0]) if row[0] is not None else None,
+            Decimal(row[1]) if row[1] is not None else None, *row[2:])
+
     def log_event(self, kind: str, message: str) -> None:
         """记录调度 / 熔断 / 抢占 / 恢复 / 告警流水，供 /last 与每日汇总。"""
         with self._lock:
@@ -875,12 +951,16 @@ class StateStore:
             r_cur = self._conn.execute(
                 "DELETE FROM runtime_counters WHERE month < ?", (runtime_cutoff,)
             )
+            b_cur = self._conn.execute(
+                "DELETE FROM bill_budget WHERE month < ?", (runtime_cutoff,)
+            )
             self._conn.commit()
             self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
         return {
             "traffic": max(0, t_cur.rowcount),
             "events": max(0, e_cur.rowcount),
             "runtime": max(0, r_cur.rowcount),
+            "billing": max(0, b_cur.rowcount),
         }
 
     def close(self) -> None:
@@ -1370,21 +1450,31 @@ class Rotator:
         self._tg_traffic(values, errors, title="📡 实时流量报告")
 
     def daily_report(self) -> None:
-        # 调度器线程查询账单，不占用 tick 锁，也不参与额度保护或选机。
+        # 调度器线程查询账单，不占用 tick 锁；已启用保护时顺便更新预算快照。
         try:
-            report = self._summary_text("🕘 每日运行报告")
+            bill_report = ""
             if self.cfg.billing.enabled:
                 try:
-                    report += "\n\n" + self._billing_report_text(force=True)
+                    bill_report = "\n\n" + self._billing_report_text(force=True)
                 except Exception:
-                    report += "\n\n⚠️ 账单查询未完成，金额未知。"
+                    bill_report = "\n\n⚠️ 账单查询未完成，金额未知。"
+            report = self._summary_text("🕘 每日运行报告") + bill_report
             self.tg.send(report)
             self.store.log_event("daily", "每日汇总已进入发送队列")
         except Exception:
             LOGGER.exception("daily_report 异常")
 
+    def billing_job(self) -> None:
+        """调度器后台刷新预算；云端启停仍由控制循环执行。"""
+        if not self._bill_guard_enabled():
+            return
+        try:
+            self._billing_report_text(force=True)
+        except Exception:
+            LOGGER.error("账单保护刷新失败，请检查本地数据库和账单配置")
+
     def _billing_report_text(self, selected: Optional[str] = None, *, force: bool = False) -> str:
-        """只缓存当月格式化汇总；失败保留旧值并明确标记，不改变控制状态。"""
+        """汇总与预算共用一次查询；失败保留旧值并明确标记。"""
         if not self.cfg.billing.enabled:
             return "账单功能未启用。"
         requested_at = time.monotonic()
@@ -1408,11 +1498,18 @@ class Rotator:
                         name, self._account_label(name), ac.access_key_id, ac.access_key_secret,
                     )
                     error = ""
+                    budget_error = ""
+                    budget_amount = None
                     summary = products = None
                     try:
                         rows = billing.query_overview(account, month)
                         summary = billing.format_overview(rows, include_products=False)
                         products = billing.format_overview(rows)
+                        if self._bill_guard_enabled():
+                            try:
+                                budget_amount = billing.budget_amount_usd(rows)
+                            except billing.BillingError as exc:
+                                budget_error = str(exc)
                     except billing.BillingError as exc:
                         error = str(exc)
                     except Exception:
@@ -1427,6 +1524,9 @@ class Rotator:
                     )
                     # 跨月完成的旧账期结果可以返回，但不得留在本月缓存。
                     if datetime.now(billing.BILL_TZ).strftime("%Y-%m") == month:
+                        if self._bill_guard_enabled():
+                            self.store.record_bill_budget(
+                                name, month, budget_amount, error or budget_error)
                         self._bill_cache[name] = cached
                     else:
                         self._bill_cache.clear()
@@ -1442,6 +1542,8 @@ class Rotator:
                 content = cached.products if selected is not None else cached.summary
                 if content is not None:
                     lines.append(content)
+                if self._bill_guard_enabled():
+                    lines.append(self._bill_budget_text(name))
             lines.extend([
                 "", "账户级税前费用，非单台 ECS 成本；不同币种及账单类型分别列示。",
                 "账单有延迟，当月金额未最终确认；暂无条目不代表没有费用。",
@@ -1524,7 +1626,7 @@ class Rotator:
                 else:
                     self._notify(
                         "切换异常",
-                        "本月额度已经重置，但目前没有符合流量、运行时长和账号状态要求的节点可恢复。",
+                        "本月额度已经重置，但目前没有符合流量、运行时长、账单保护和账号状态要求的节点可恢复。",
                     )
         except Exception:
             LOGGER.exception("month_reset 异常")
@@ -1696,6 +1798,7 @@ class Rotator:
             self._pending = [it for it in self._pending if it.get("type") == "TRAFFIC_REFRESH"]
         if self._freeze_unknown(obs):
             return True
+        self._bill_budget_alerts()
         state = self.sj.load()
         tr = state.get("transition")
         if not tr or tr.get("breaker") or tr.get("step") == STEP_T1:
@@ -1711,7 +1814,8 @@ class Rotator:
             if candidates:
                 to = self._pick_candidate(candidates, runtimes)
                 self._start_transition(
-                    from_=target, to=to, reason="traffic", replace=True,
+                    from_=target, to=to,
+                    reason="bill_budget" if self._bill_exceeded(target) else "traffic", replace=True,
                     stop_list=[a for a in self.cfg.accounts if a != to],
                 )
             else:
@@ -1721,7 +1825,8 @@ class Rotator:
 
     def _quota_exceeded(self, account: str, runtimes: dict, traffic: dict) -> bool:
         return (runtimes.get(account, 0) >= self.cfg.th.tmax_hours * 3600
-                or (account in traffic and traffic[account] >= self.cfg.th.traffic_threshold_gb))
+                or (account in traffic and traffic[account] >= self.cfg.th.traffic_threshold_gb)
+                or self._bill_exceeded(account))
 
     def _derive_and_act(self, obs: dict) -> None:
         if self._freeze_unknown(obs):
@@ -1832,7 +1937,7 @@ class Rotator:
                 if to is None:
                     self._notify(
                         "切换异常",
-                        "无法恢复服务：当前没有同时满足流量、运行时长和账号状态要求的节点。",
+                        "无法恢复服务：当前没有同时满足流量、运行时长、账单保护和账号状态要求的节点。",
                     )
                 else:
                     self._start_transition(to=to, reason="resume")
@@ -1950,8 +2055,11 @@ class Rotator:
             self.sj.save(state)
             return
 
-        # 触发：Tmax（要求 5）
+        # 触发：可选账单保护 / Tmax；沿用原有切换失败退避。
         runtimes = self.store.get_runtimes()
+        if self._bill_exceeded(duty):
+            self._start_transition(from_=duty, reason="bill_budget")
+            return
         if runtimes.get(duty, 0) >= self.cfg.th.tmax_hours * 3600:
             self._start_transition(from_=duty, reason="tmax")
             return
@@ -2019,7 +2127,7 @@ class Rotator:
                 "no-eligible-zero",
                 self.cfg.th.alert_repeat_interval_sec,
                 "切换异常",
-                "当前没有在线节点，也没有符合流量、运行时长和账号状态要求的备用节点。\n"
+                "当前没有在线节点，也没有符合流量、运行时长、账单保护和账号状态要求的备用节点。\n"
                 "系统将在稍后继续检查。",
             )
             return
@@ -2069,7 +2177,7 @@ class Rotator:
                 return self._abort_transition(
                     tr,
                     state,
-                    f"节点 {self._account_label(to)} 不满足流量、运行时长或账号状态要求",
+                    f"节点 {self._account_label(to)} 不满足流量、运行时长、账单保护或账号状态要求",
                 )
             LOGGER.info(
                 "T1 目标校验通过 account=%s runtime=%ss/%ss traffic=%.1fGB/%.1fGB",
@@ -2529,6 +2637,63 @@ class Rotator:
 
     # —— 内部：目标选择 / 启动 / 探测 / 通知 ——
 
+    def _bill_guard_enabled(self) -> bool:
+        return self.cfg.billing.enabled and self.cfg.billing.threshold_usd is not None
+
+    def _bill_budget_status(self, account: str) -> tuple[str, Optional[BillBudgetSnapshot]]:
+        """控制路径只读 SQLite，不等待网络查询锁。已知超额不因过期或失败失效。"""
+        if not self._bill_guard_enabled():
+            return "disabled", None
+        snapshot = self.store.get_bill_budget(account)
+        if snapshot is None:
+            return "unknown", None
+        if snapshot.highwater is not None and snapshot.highwater >= self.cfg.billing.threshold_usd:
+            return "exceeded", snapshot
+        if snapshot.error or snapshot.amount is None or snapshot.queried_at is None:
+            return "unknown", snapshot
+        try:
+            age = (datetime.now(APP_TZ).replace(tzinfo=None)
+                   - datetime.fromisoformat(snapshot.queried_at).replace(tzinfo=None)).total_seconds()
+        except (TypeError, ValueError):
+            return "unknown", snapshot
+        if not -300 <= age <= self.cfg.billing.stale_sec:
+            return "unknown", snapshot
+        return "ok", snapshot
+
+    def _bill_exceeded(self, account: str) -> bool:
+        return self._bill_budget_status(account)[0] == "exceeded"
+
+    def _bill_budget_text(self, account: str) -> str:
+        status, snapshot = self._bill_budget_status(account)
+        if status == "disabled":
+            return "   账单停机保护：未启用"
+        limit = self.cfg.billing.threshold_usd
+        if status == "unknown":
+            detail = snapshot.error if snapshot and snapshot.error else "暂无有效快照或数据已过期"
+            old = (f"；上次 USD {snapshot.amount:f}（{snapshot.queried_at}）"
+                   if snapshot and snapshot.amount is not None else "")
+            return f"   账单保护：金额未知 / USD {limit:f}；{detail}{old}；沿用流量和时长规则"
+        if status == "exceeded":
+            return (f"   账单保护：本月最高已知 USD {snapshot.highwater:f} / USD {limit:f}；"
+                    "已触发，本月禁止自动或手动选入")
+        return (f"   账单保护：USD {snapshot.amount:f} / USD {limit:f}；"
+                f"查询于 {snapshot.queried_at}（非实时费用）")
+
+    def _bill_budget_alerts(self) -> None:
+        if not self._bill_guard_enabled():
+            return
+        for account in self.cfg.accounts:
+            status, _ = self._bill_budget_status(account)
+            if status in ("unknown", "exceeded"):
+                self._notify_throttled(
+                    f"bill-budget:{account}:{status}",
+                    self.cfg.th.alert_repeat_interval_sec, "切换异常",
+                    f"节点 {self._account_label(account)}\n{self._bill_budget_text(account)}\n"
+                    + ("当班节点将按现有流程切换，无候选时执行保护停机。"
+                       if status == "exceeded" else
+                       "不会仅因账单未知停止正常当班节点；请检查账单查询。"),
+                )
+
     def _pick_candidate(self, candidates: list[str], runtimes: dict) -> Optional[str]:
         """只对已筛选的候选择优；完全相同时保持原候选顺序。"""
         if not candidates:
@@ -2547,7 +2712,8 @@ class Rotator:
                     if runtimes.get(a, 0) < tmax
                     and a in traffic
                     and traffic[a] < thresh
-                    and self._healthy(a)]
+                    and self._healthy(a)
+                    and not self._bill_exceeded(a)]
         return self._pick_candidate(eligible, runtimes)
 
     def _eligible(self, a: str, runtimes: dict, traffic: dict) -> bool:
@@ -2555,7 +2721,8 @@ class Rotator:
         return (runtimes.get(a, 0) < tmax
                 and a in traffic
                 and traffic[a] < self.cfg.th.traffic_threshold_gb
-                and self._healthy(a))
+                and self._healthy(a)
+                and not self._bill_exceeded(a))
 
     def _healthy(self, a: str) -> bool:
         # 欠费账号移出 eligible（ArrearsError 标记，月重置清空）
@@ -2657,6 +2824,7 @@ class Rotator:
         self.sj.save(ns)
         LOGGER.info("启动流水线 reason=%s from=%s to=%s breaker=%s", reason, from_, to, breaker)
         kind = {"spot_warn": "抢占恢复", "tmax": "超限停机", "traffic": "超限停机",
+                "bill_budget": "超限停机",
                 "manual": "临时调度", "month_reset": "临时调度", "resume": "临时调度",
                 "no_eligible": "全局熔断", "cleanup_multi": "切换异常"}.get(reason, "临时调度")
         if breaker:
@@ -2786,6 +2954,8 @@ class Rotator:
                 f"   本月运行：{rt / 3600:.1f} 小时",
                 f"   本月流量：{traffic_text}",
             ])
+            if self._bill_guard_enabled():
+                lines.append(self._bill_budget_text(name))
             if warnings:
                 lines.append(f"   ⚠️ 提醒：{'；'.join(warnings)}")
         return "\n".join(lines)
@@ -2980,6 +3150,11 @@ def _run(cfg: Config) -> None:
                       coalesce=True, max_instances=1, id="month")
     scheduler.add_job(rotator.maintenance_job, CronTrigger(hour=0, minute=30, timezone=APP_TZ),
                       coalesce=True, max_instances=1, id="maintenance")
+    if rotator._bill_guard_enabled():
+        scheduler.add_job(
+            rotator.billing_job, "interval", minutes=cfg.billing.refresh_interval_min,
+            next_run_time=datetime.now(APP_TZ), coalesce=True, max_instances=1, id="billing",
+        )
 
     # TG 命令菜单 + 长轮询（回调只入队/只读）
     tg.register_commands(billing_enabled=cfg.billing.enabled)
