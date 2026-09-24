@@ -5,6 +5,7 @@
 # 每个账号键对应一组账户凭据和一台 ECS；账号键用于命令及本地历史记录。
 accounts:
   A:
+    priority: 100                 # 可省略，默认 100；仅 priority 策略使用，非负整数，越小越优先
     region: cn-hongkong
     access_key_id: "YOUR_ACCOUNT_A_ACCESS_KEY_ID"
     access_key_secret: "YOUR_ACCOUNT_A_ACCESS_KEY_SECRET"
@@ -16,6 +17,7 @@ accounts:
     # ecs_endpoint: ""             # 可选接入点，默认 ecs.<region>.aliyuncs.com
     # cdt_endpoint: "cdt.aliyuncs.com"
   B:
+    priority: 100
     region: cn-hongkong
     access_key_id: "YOUR_ACCOUNT_B_ACCESS_KEY_ID"
     access_key_secret: "YOUR_ACCOUNT_B_ACCESS_KEY_SECRET"
@@ -23,6 +25,13 @@ accounts:
     instance_name: "节点 B"
     eip: "203.0.113.11"
     service_port: 31227
+
+# 候选选择策略，修改后重启。省略时保持原来的运行时长均衡策略。
+scheduling:
+  strategy: balanced             # balanced / priority
+  # priority：先比较优先级，同级比较本月运行时长，再相同按 accounts 配置顺序。
+  # A/B 主力、C 备用：给 A/B 设置 priority: 10，C 设置 priority: 100。
+  # 只影响已通过资格筛选的候选选择；不会主动从 C 回切至 A/B。
 
 telegram:
   bot_token: "YOUR_TELEGRAM_BOT_TOKEN"

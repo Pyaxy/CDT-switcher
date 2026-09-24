@@ -155,6 +155,7 @@ class AccountCfg:
     instance_name: str = ""                       # TG 友好显示名；空则采用 ECS InstanceName
     ecs_endpoint: str = ""                          # 空则默认 f"ecs.{region}.aliyuncs.com"
     cdt_endpoint: str = "cdt.aliyuncs.com"
+    priority: int = 100                           # priority 策略使用；数值越小越优先
 
 
 @dataclass
@@ -195,6 +196,11 @@ class BillingCfg:
     enabled: bool = False
 
 
+@dataclass
+class SchedulingCfg:
+    strategy: str = "balanced"
+
+
 @dataclass(frozen=True)
 class BillSnapshot:
     summary: Optional[str]
@@ -211,6 +217,7 @@ class Config:
     tg: TGCfg
     th: Thresholds
     billing: BillingCfg = field(default_factory=BillingCfg)
+    scheduling: SchedulingCfg = field(default_factory=SchedulingCfg)
 
 
 # 环境变量 → Thresholds 字段（存在即覆盖，类型转换失败则告警忽略）
@@ -277,6 +284,8 @@ def _validate_config(accounts: dict[str, AccountCfg], th: Thresholds) -> None:
             raise ValueError("accounts 的账号键必须是非空字符串")
         if name != name.strip():
             raise ValueError(f"账号键 {name!r} 不能包含首尾空格")
+        if type(ac.priority) is not int or ac.priority < 0:
+            raise ValueError(f"账号 {name} 的 priority 必须是非负整数")
         if not 1 <= ac.service_port <= 65535:
             raise ValueError(f"账号 {name} 的 service_port 必须在 1..65535")
         for field_name in ("region", "access_key_id", "access_key_secret", "instance_id", "eip"):
@@ -345,6 +354,7 @@ def load_config(path: str = "config.yaml") -> Config:
                 instance_name=str(ac.get("instance_name", "") or "").strip(),
                 ecs_endpoint=ac.get("ecs_endpoint", ""),
                 cdt_endpoint=ac.get("cdt_endpoint", "cdt.aliyuncs.com"),
+                priority=ac.get("priority", 100),
             )
         except KeyError as e:
             raise ValueError(f"账号 {name} 缺少必填字段: {e}") from e
@@ -400,7 +410,14 @@ def load_config(path: str = "config.yaml") -> Config:
     enabled = billing_raw.get("enabled", False)
     if not isinstance(enabled, bool):
         raise ValueError("billing.enabled 必须是布尔值 true 或 false")
-    return Config(accounts=accounts, tg=tg, th=th, billing=BillingCfg(enabled=enabled))
+    scheduling_raw = data.get("scheduling", {})
+    if not isinstance(scheduling_raw, dict):
+        raise ValueError("scheduling 必须是对象")
+    strategy = scheduling_raw.get("strategy", "balanced")
+    if strategy not in ("balanced", "priority"):
+        raise ValueError("scheduling.strategy 必须是 balanced 或 priority")
+    return Config(accounts=accounts, tg=tg, th=th, billing=BillingCfg(enabled=enabled),
+                  scheduling=SchedulingCfg(strategy=strategy))
 
 
 # ===== Section 2: 阿里云账号客户端 =====
@@ -1692,7 +1709,7 @@ class Rotator:
             candidates = [a for a in self.cfg.accounts
                           if obs[a].obs != OBS_NOT_FOUND and self._eligible(a, runtimes, traffic)]
             if candidates:
-                to = min(candidates, key=lambda a: runtimes.get(a, 0))
+                to = self._pick_candidate(candidates, runtimes)
                 self._start_transition(
                     from_=target, to=to, reason="traffic", replace=True,
                     stop_list=[a for a in self.cfg.accounts if a != to],
@@ -1961,7 +1978,7 @@ class Rotator:
         self.sj.save(state)
 
     def _handle_degraded_multi(self, obs: dict, state: dict) -> None:
-        # DEGRADED_MULTI：胜者=Running 中 argmin runtime 且有余量者，其余 T4 停机（要求 6，设计 §8）
+        # 仅在合格的运行节点中按配置策略保留一台，其余进入 T4 停机。
         running = [a for a, o in obs.items() if o.obs == OBS_RUNNING]
         runtimes = self.store.get_runtimes()
         traffic = self.store.latest_traffic(self.cfg.th.traffic_stale_sec)
@@ -1979,7 +1996,7 @@ class Rotator:
                     "检测到多台在线，但没有足够的新鲜用量数据安全选机，等待流量查询恢复。",
                 )
             return
-        winner = min(cands, key=lambda a: runtimes.get(a, 0))
+        winner = self._pick_candidate(cands, runtimes)
         losers = [a for a in running if a != winner]
         if losers:
             self._start_transition(from_=winner, to=winner, reason="cleanup_multi", stop_list=losers)
@@ -2512,8 +2529,17 @@ class Rotator:
 
     # —— 内部：目标选择 / 启动 / 探测 / 通知 ——
 
+    def _pick_candidate(self, candidates: list[str], runtimes: dict) -> Optional[str]:
+        """只对已筛选的候选择优；完全相同时保持原候选顺序。"""
+        if not candidates:
+            return None
+        if self.cfg.scheduling.strategy == "priority":
+            return min(candidates, key=lambda a: (
+                self.cfg.accounts[a].priority, runtimes.get(a, 0)))
+        return min(candidates, key=lambda a: runtimes.get(a, 0))
+
     def _select_target(self, runtimes: dict) -> Optional[str]:
-        # eligible 中 argmin runtime；空 -> None（要求：设计 §3.2）
+        # 先按原资格条件筛选，再应用候选选择策略。
         traffic = self.store.latest_traffic(self.cfg.th.traffic_stale_sec)
         tmax = self.cfg.th.tmax_hours * 3600
         thresh = self.cfg.th.traffic_threshold_gb
@@ -2522,9 +2548,7 @@ class Rotator:
                     and a in traffic
                     and traffic[a] < thresh
                     and self._healthy(a)]
-        if not eligible:
-            return None
-        return min(eligible, key=lambda a: runtimes.get(a, 0))
+        return self._pick_candidate(eligible, runtimes)
 
     def _eligible(self, a: str, runtimes: dict, traffic: dict) -> bool:
         tmax = self.cfg.th.tmax_hours * 3600
