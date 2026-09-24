@@ -56,6 +56,8 @@ thresholds:
   stop_retry_interval_sec: 300     # 停机请求重试间隔；ENV: STOP_RETRY_INTERVAL
   stop_alarm_interval_sec: 1800    # 停机异常重复告警间隔；ENV: STOP_ALARM_INTERVAL
   alert_repeat_interval_sec: 1800  # 同类告警最短重复间隔；ENV: ALERT_REPEAT_INTERVAL
+  observation_failure_threshold: 3  # 每节点连续实例查询失败 N 次后告警；ENV: OBSERVATION_FAILURE_THRESHOLD
+  # 成功一次清零；首次失败仍立即暂停自动启停。设为 1 可恢复立即告警。
 
   # 数据有效期与历史清理
   traffic_stale_sec: 3600          # 候选选择接受的快照最大年龄；ENV: TRAFFIC_STALE

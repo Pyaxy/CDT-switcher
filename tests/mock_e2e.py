@@ -658,6 +658,8 @@ def s22_observation_failure_is_not_not_found():
     assert st["accounts"][duty]["last_observed"] == m.OBS_UNKNOWN
     assert st.get("transition") is None
     assert {name: (f.status, f.duty) for name, f in fakes.items()} == before
+    assert not any("暂停自动启停" in msg for msg in tg.messages)
+    ticks(r, r.cfg.th.observation_failure_threshold - 1)
     assert any("暂停自动启停" in msg for msg in tg.messages)
 
     # T4 看到 UNKNOWN 也不能把旧机标成已停。

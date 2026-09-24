@@ -178,6 +178,7 @@ class Thresholds:
     stop_retry_interval_sec: int = 300
     stop_alarm_interval_sec: int = 1800
     alert_repeat_interval_sec: int = 1800
+    observation_failure_threshold: int = 3
     traffic_stale_sec: int = 3600
     traffic_retention_days: int = 180
     event_retention_days: int = 180
@@ -226,6 +227,7 @@ _ENV_TYPE_MAP = {
     "STOP_RETRY_INTERVAL": ("stop_retry_interval_sec", int),
     "STOP_ALARM_INTERVAL": ("stop_alarm_interval_sec", int),
     "ALERT_REPEAT_INTERVAL": ("alert_repeat_interval_sec", int),
+    "OBSERVATION_FAILURE_THRESHOLD": ("observation_failure_threshold", int),
     "TRAFFIC_STALE": ("traffic_stale_sec", int),
     "TRAFFIC_RETENTION_DAYS": ("traffic_retention_days", int),
     "EVENT_RETENTION_DAYS": ("event_retention_days", int),
@@ -289,7 +291,7 @@ def _validate_config(accounts: dict[str, AccountCfg], th: Thresholds) -> None:
         "probe_interval_sec", "probe_required_success", "probe_timeout_sec",
         "stop_timeout_sec", "stop_retry_interval_sec", "stop_alarm_interval_sec",
         "alert_repeat_interval_sec", "traffic_stale_sec", "traffic_retention_days",
-        "event_retention_days", "runtime_retention_months",
+        "event_retention_days", "runtime_retention_months", "observation_failure_threshold",
     )
     for field_name in positive_ints:
         if getattr(th, field_name) <= 0:
@@ -1231,6 +1233,7 @@ class Rotator:
         self.intents: "queue.Queue" = queue.Queue(maxsize=self.MAX_INTENT_QUEUE_SIZE)
         self._pending: list = []          # 已出队的待处理意图
         self._probe_fails: dict = {}      # 账号 -> 连续服务探测失败次数
+        self._observation_fails: dict[str, int] = {}  # 每账号连续实例观测失败次数
         self._arrears: set = set()        # 欠费账号（内存态，月重置清空）
         self._cooldown: dict = {}         # 账号/特殊键 -> 退避截止 epoch
         self._notification_last: dict[str, float] = {}  # 重复告警节流
@@ -1586,19 +1589,23 @@ class Rotator:
 
     # —— 内部：观测与记账 ——
 
+    def _observe_one(self, name: str) -> InstanceObs:
+        # 按实际查询计数；同一快照经过多次安全守卫时不重复累计。
+        try:
+            observed = self.clients[name].get_instance_obs()
+        except Exception as e:
+            LOGGER.warning("观测 %s 失败: %s", name, e)
+            observed = InstanceObs(exists=None, obs=OBS_UNKNOWN)
+        if observed.obs == OBS_UNKNOWN:
+            self._observation_fails[name] = self._observation_fails.get(name, 0) + 1
+        else:
+            self._observation_fails[name] = 0
+        if observed.instance_name and not self.cfg.accounts[name].instance_name:
+            self._instance_names[name] = observed.instance_name
+        return observed
+
     def _observe_all(self) -> dict:
-        # 单账号观测失败只记日志，该账号 obs 视为未知不崩溃（要求 1）
-        out = {}
-        for name, cli in self.clients.items():
-            try:
-                observed = cli.get_instance_obs()
-                out[name] = observed
-                if observed.instance_name and not self.cfg.accounts[name].instance_name:
-                    self._instance_names[name] = observed.instance_name
-            except Exception as e:
-                LOGGER.warning("观测 %s 失败: %s", name, e)
-                out[name] = InstanceObs(exists=None, obs=OBS_UNKNOWN)
-        return out
+        return {name: self._observe_one(name) for name in self.clients}
 
     def _account(self, obs: dict) -> None:
         # 记账：每 tick 对 RUNNING 账号累加 patrol_interval_sec（要求 2）
@@ -1653,12 +1660,15 @@ class Rotator:
         state.setdefault("global_state", GS_UNKNOWN)
         self._sync_accounts_obs(state, obs)
         self.sj.save(state)
-        self._notify_throttled(
-            "observation-unknown", self.cfg.th.alert_repeat_interval_sec, "切换异常",
-            "暂时无法确认以下节点状态：\n"
-            + "\n".join(f"• {self._account_label(a)}" for a in unknown)
-            + "\n系统已暂停自动启停，恢复观测后会继续运行。",
-        )
+        for account in unknown:
+            failures = self._observation_fails.get(account, 0)
+            if failures >= self.cfg.th.observation_failure_threshold:
+                self._notify_throttled(
+                    f"observation-unknown:{account}",
+                    self.cfg.th.alert_repeat_interval_sec, "切换异常",
+                    f"连续 {failures} 次无法确认节点 {self._account_label(account)} 的状态。\n"
+                    "系统已暂停自动启停，恢复观测后会继续运行。",
+                )
         return True
 
     def _control_safety(self, obs: dict) -> bool:
@@ -2204,10 +2214,7 @@ class Rotator:
                 to = tr["to"]
                 if acc == to:
                     raise ValueError("停机列表包含目标实例，拒绝执行")
-                try:
-                    target_obs = self.clients[to].get_instance_obs()
-                except Exception:
-                    target_obs = InstanceObs(obs=OBS_UNKNOWN)
+                target_obs = self._observe_one(to)
                 current = dict(obs)
                 current[to] = target_obs
                 if self._freeze_unknown(current):
@@ -2336,8 +2343,14 @@ class Rotator:
             try:
                 LOGGER.info("T5 写入 duty 标签 account=%s desired=%s", account, desired)
                 self.clients[account].set_duty(desired)
-                confirmed = self.clients[account].get_instance_obs()
-                if confirmed.obs in (OBS_UNKNOWN, OBS_STARTING):
+                confirmed = self._observe_one(account)
+                if confirmed.obs == OBS_UNKNOWN:
+                    tag_retry_at[account] = now + retry_interval
+                    current = dict(obs)
+                    current[account] = confirmed
+                    self._freeze_unknown(current)
+                    return self._with_tr(state, tr)
+                if confirmed.obs == OBS_STARTING:
                     raise CloudAPIError("标签回读时实例状态暂不可确认")
                 if desired and confirmed.obs != OBS_RUNNING:
                     ns = dict(state)
