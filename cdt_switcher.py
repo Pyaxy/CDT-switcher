@@ -26,6 +26,15 @@ except Exception:  # Tea 为传递依赖，缺失时退化为通用异常，保�
     TeaException = Exception
 
 LOGGER = logging.getLogger("cdt_switcher")
+TG_CONTROL_TTL_SEC = 120
+
+
+def _tg_control_fresh(timestamp) -> bool:
+    """Accept only valid, recent Telegram message timestamps."""
+    return (isinstance(timestamp, int) and not isinstance(timestamp, bool)
+            and 0 <= time.time() - timestamp <= TG_CONTROL_TTL_SEC)
+
+
 try:
     APP_TZ = ZoneInfo("Asia/Shanghai")
 except ZoneInfoNotFoundError:  # 极简系统未安装 tzdata 时仍按中国标准时间运行
@@ -191,6 +200,7 @@ class Thresholds:
     webhook_listen: str = "127.0.0.1:8787"
     db_path: str = "rotator.db"
     state_path: str = "state.json"
+    quota_handover_grace_sec: int = 1800
 
 
 @dataclass
@@ -241,6 +251,7 @@ _ENV_TYPE_MAP = {
     "TRAFFIC_THRESHOLD_GB": ("traffic_threshold_gb", float),
     "TMAX_HOURS": ("tmax_hours", float),
     "START_TIMEOUT": ("start_timeout_sec", int),
+    "QUOTA_HANDOVER_GRACE_SEC": ("quota_handover_grace_sec", int),
     "PROBE_INTERVAL": ("probe_interval_sec", int),
     "PROBE_REQUIRED_SUCCESS": ("probe_required_success", int),
     "PROBE_TIMEOUT": ("probe_timeout_sec", int),
@@ -310,7 +321,7 @@ def _validate_config(accounts: dict[str, AccountCfg], th: Thresholds) -> None:
         instance_ids.add(ac.instance_id)
 
     positive_ints = (
-        "patrol_interval_sec", "traffic_interval_min", "start_timeout_sec",
+        "patrol_interval_sec", "traffic_interval_min", "start_timeout_sec", "quota_handover_grace_sec",
         "probe_interval_sec", "probe_required_success", "probe_timeout_sec",
         "stop_timeout_sec", "stop_retry_interval_sec", "stop_alarm_interval_sec",
         "alert_repeat_interval_sec", "traffic_stale_sec", "traffic_retention_days",
@@ -1241,7 +1252,7 @@ class TGClient:
         except Exception as exc:
             LOGGER.warning("TG 命令菜单注册异常: %s", self._safe_error(exc))
 
-    def start_polling(self, on_command: Callable[[str, int], None]) -> None:
+    def start_polling(self, on_command: Callable[..., None]) -> None:
         # 启动守护线程做 getUpdates 长轮询；白名单过滤；把 "/cmd args"
         # 归一为 "cmd args" 后回调 on_command。线程内绝不调云 API。
         if not self._token:
@@ -1252,7 +1263,7 @@ class TGClient:
         )
         self._poll_thread.start()
 
-    def _poll_loop(self, on_command: Callable[[str, int], None]) -> None:
+    def _poll_loop(self, on_command: Callable[..., None]) -> None:
         # 长轮询主循环：失败指数退避；429 优先服从 retry_after；同类日志节流。
         failures = 0
         while not self._stop_event.is_set():
@@ -1290,7 +1301,7 @@ class TGClient:
                 )
                 self._stop_event.wait(wait)
 
-    def _handle_update(self, upd: dict, on_command: Callable[[str, int], None]) -> None:
+    def _handle_update(self, upd: dict, on_command: Callable[..., None]) -> None:
         # 只处理白名单 chat 的文本消息，非命令消息忽略。
         msg = upd.get("message")
         if not msg:
@@ -1305,7 +1316,15 @@ class TGClient:
         cmd = self._normalize_cmd(text)
         if cmd:
             # 回调交由状态机层入队，线程内不碰云 API
-            on_command(cmd, cid)
+            if cmd.split()[0] in ("switch", "resume", "breaker"):
+                timestamp = msg.get("date")
+                if not _tg_control_fresh(timestamp):
+                    LOGGER.warning("丢弃时间无效或已过期的 TG 控制命令")
+                    self.send("⚠️ 这条控制命令已过期或时间无效，请重新发送。")
+                    return
+                on_command(cmd, cid, timestamp)
+            else:
+                on_command(cmd, cid)
 
     @staticmethod
     def _normalize_cmd(text: str) -> str:
@@ -1353,6 +1372,7 @@ class Rotator:
         self._observation_fails: dict[str, int] = {}  # 每账号连续实例观测失败次数
         self._arrears: set = set()        # 欠费账号（内存态，月重置清空）
         self._cooldown: dict = {}         # 账号/特殊键 -> 退避截止 epoch
+        self._target_backoff: dict = {}   # 目标账号 -> (连续失败次数, 退避截止 epoch)
         self._notification_last: dict[str, float] = {}  # 重复告警节流
         self._tick_lock = threading.Lock()
         self._traffic_lock = threading.Lock()
@@ -1397,7 +1417,10 @@ class Rotator:
     def transition_tick(self) -> None:
         """快速消费控制意图并推进流水线；不做运行时记账或稳态巡检。"""
         state = self.sj.load()
-        if not state.get("transition") and self.intents.empty() and not self._pending and not self._breaker_requested.is_set():
+        deadline_due = any(time.time() >= entry["deadline"]
+                           for entry in state.get("quota_deadlines", {}).values())
+        if (not state.get("transition") and not deadline_due
+                and self.intents.empty() and not self._pending and not self._breaker_requested.is_set()):
             return
         if not self._tick_lock.acquire(blocking=False):
             return
@@ -1643,7 +1666,7 @@ class Rotator:
                         "本月额度已经重置。\n"
                         f"准备恢复节点：{self._account_label(to)}",
                     )
-                else:
+                elif not self._wait_for_cooled_recovery(st):
                     self._notify(
                         "切换异常",
                         "本月额度已经重置，但目前没有符合流量、运行时长、账单保护和账号状态要求的节点可恢复。",
@@ -1651,11 +1674,12 @@ class Rotator:
         except Exception:
             LOGGER.exception("month_reset 异常")
 
-    def handle_tg_command(self, cmd: str, chat_id: int) -> None:
+    def handle_tg_command(self, cmd: str, chat_id: int, message_date: Optional[int] = None) -> None:
         # 只入队 / 只读查询，绝不直接调云写 API（要求 8/9，TG 线程安全）
         parts = cmd.strip().split()
         c = parts[0].lstrip("/") if parts else ""
         arg = parts[1] if len(parts) > 1 else ""
+        tg_meta = {"tg_date": message_date} if message_date is not None else {}
         if c == "check":
             self._tg_check()
         elif c == "bill" and self.cfg.billing.enabled:
@@ -1677,7 +1701,7 @@ class Rotator:
         elif c == "last":
             self._tg_last()
         elif c == "switch":
-            if not self.submit_intent("SWITCH", account=arg or None):
+            if not self.submit_intent("SWITCH", account=arg or None, **tg_meta):
                 self.tg.send("⚠️ 系统请求较多，本次切换请求未进入队列，请稍后重试。")
                 return
             target = self._account_label(arg) if arg else "由系统自动选择"
@@ -1702,7 +1726,7 @@ class Rotator:
                     "确认执行请发送：/breaker confirm"
                 )
         elif c == "resume":
-            if not self.submit_intent("RESUME"):
+            if not self.submit_intent("RESUME", **tg_meta):
                 self.tg.send("⚠️ 系统请求较多，本次恢复请求未进入队列，请稍后重试。")
                 return
             self.tg.send(
@@ -1765,8 +1789,17 @@ class Rotator:
                 it = self.intents.get_nowait()
             except queue.Empty:
                 break
-            if it not in self._pending:      # 同参意图去重，防止长流水线期间堆积
+            # 时间戳不是意图语义的一部分。相同控制意图保留最新有效期限；
+            # 内部意图无期限，不能被 TG 命令缩短。
+            key = {k: v for k, v in it.items() if k != "tg_date"}
+            existing = next((p for p in self._pending
+                             if {k: v for k, v in p.items() if k != "tg_date"} == key), None)
+            if existing is None:
                 self._pending.append(it)
+            elif "tg_date" not in it:
+                existing.pop("tg_date", None)
+            elif "tg_date" in existing:
+                existing["tg_date"] = max(existing["tg_date"], it["tg_date"])
         if len(self._pending) > 50:          # 积压上限：只保留最新 50 条
             dropped = len(self._pending) - 50
             self._pending = self._pending[-50:]
@@ -1810,12 +1843,69 @@ class Rotator:
                 )
         return True
 
+    def _enforce_quota_deadlines(self, obs: dict, runtimes: dict, traffic: dict) -> None:
+        """额度交接期限属于在线实例，独立于可能多次更换的切换游标。"""
+        state = self.sj.load()
+        previous = state.get("quota_deadlines", {})
+        deadlines = {}
+        now = time.time()
+        month = current_month()
+        tr = state.get("transition")
+        for account, ob in obs.items():
+            instance_id = self.cfg.accounts[account].instance_id
+            entry = previous.get(account)
+            if entry and (entry["month"] != month or entry["instance_id"] != instance_id):
+                entry = None
+            exceeded = self._quota_exceeded(account, runtimes, traffic)
+            if not entry:
+                if ob.obs != OBS_RUNNING or not exceeded:
+                    continue
+                entry = {"month": month, "instance_id": instance_id,
+                         "deadline": now + self.cfg.th.quota_handover_grace_sec}
+            elif not exceeded and account in traffic and "retry_at" not in entry:
+                continue  # 本月新鲜数据已恢复资格
+            entry = dict(entry)
+            if (now >= entry["deadline"] and ob.obs in (OBS_RUNNING, OBS_STOPPED_KM)
+                    and now >= entry.get("retry_at", 0)):
+                # 正常 T4 已经提交的停止也计入重试节流。
+                stop_retries = (tr or {}).get("meta", {}).get("stop_retry_at", {})
+                if now >= stop_retries.get(account, 0):
+                    try:
+                        self.clients[account].stop_instance_stopcharging()
+                    except SwitcherError as exc:
+                        LOGGER.warning("超限期限到期，停止 %s 失败: %s", account, exc)
+                    entry["retry_at"] = now + self.cfg.th.stop_retry_interval_sec
+                    if tr and account in tr.get("stop_list", []):
+                        tr["meta"].setdefault("stop_retry_at", {})[account] = entry["retry_at"]
+                    self._notify_throttled(
+                        f"quota-deadline:{account}", self.cfg.th.stop_alarm_interval_sec,
+                        "超限停机", f"节点 {self._account_label(account)} 超限交接期限已到，"
+                        "正在强制执行节省停机并回读确认。",
+                    )
+                    obs[account] = ob = self._observe_one(account)
+            if ob.obs in (OBS_STOPPED_SC, OBS_NOT_FOUND):
+                if "retry_at" in entry:
+                    if tr and tr.get("from") == account and tr.get("to") != account:
+                        tr["from"] = None  # 交接失败也不能回滚到已停旧机
+                    if state.get("duty_account") == account:
+                        state["duty_account"] = None
+                        if not tr and not state.get("breaker_latched"):
+                            state = self._classify(obs, state)
+                continue
+            deadlines[account] = entry
+        if deadlines != previous:
+            state["quota_deadlines"] = deadlines
+            self.sj.save(state)
+
     def _control_safety(self, obs: dict) -> bool:
         """两个调度入口共用；先持久化紧急意图，未知态冻结，切换中仍检查额度。"""
         if self._breaker_requested.is_set():
             self._start_transition(breaker=True, reason="manual_breaker", replace=True)
             self._breaker_requested.clear()  # 落盘成功后才确认消费
             self._pending = [it for it in self._pending if it.get("type") == "TRAFFIC_REFRESH"]
+        runtimes = self.store.get_runtimes()
+        traffic = self.store.latest_traffic(self.cfg.th.traffic_stale_sec)
+        self._enforce_quota_deadlines(obs, runtimes, traffic)
         if self._freeze_unknown(obs):
             return True
         self._bill_budget_alerts()
@@ -1824,13 +1914,21 @@ class Rotator:
         if not tr or tr.get("breaker") or tr.get("step") == STEP_T1:
             # T1 尚未执行云侧动作，由预检直接拒绝不合格目标；不能悄悄改写手动选择。
             return False
-        traffic = self.store.latest_traffic(self.cfg.th.traffic_stale_sec)
-        runtimes = self.store.get_runtimes()
         target = tr.get("to")
+        # 回滚必须先确认失败目标已停，不能被超额的保留节点抢占。
+        if tr.get("meta", {}).get("reason") == "rollback":
+            return False
         # 原节点超限但已在安全切换中时保持原流程；目标超限则重新选目标。
         if target and self._quota_exceeded(target, runtimes, traffic):
+            meta = tr.get("meta", {})
+            if (target != tr.get("from") and obs[target].obs != OBS_RUNNING and
+                    (meta.get("t2_submitted") or meta.get("t2_started")
+                     or obs[target].obs == OBS_STARTING)):
+                self._rollback(tr, state, f"节点 {self._account_label(target)} 已超出额度")
+                return False
             candidates = [a for a in self.cfg.accounts
-                          if obs[a].obs != OBS_NOT_FOUND and self._eligible(a, runtimes, traffic)]
+                          if obs[a].obs != OBS_NOT_FOUND and self._eligible(a, runtimes, traffic)
+                          and time.time() >= self._target_backoff.get(a, (0, 0))[1]]
             if candidates:
                 to = self._pick_candidate(candidates, runtimes)
                 self._start_transition(
@@ -1838,9 +1936,12 @@ class Rotator:
                     reason="bill_budget" if self._bill_exceeded(target) else "traffic", replace=True,
                     stop_list=[a for a in self.cfg.accounts if a != to],
                 )
-            else:
-                # 已确认目标超限且没有可安全承接的节点，启动保护停机。
+            elif not any(obs[a].obs != OBS_NOT_FOUND and self._eligible(a, runtimes, traffic)
+                         for a in self.cfg.accounts):
                 self._start_transition(breaker=True, reason="no_eligible", replace=True)
+            else:
+                # 所有合格候选均在冷却；暂停超额目标，额度期限仍由前面的守卫执行。
+                return True
         return False
 
     def _quota_exceeded(self, account: str, runtimes: dict, traffic: dict) -> bool:
@@ -1942,6 +2043,10 @@ class Rotator:
         state = self.sj.load()
         it = self._pending.pop(0)
         t = it.get("type")
+        if t in ("SWITCH", "RESUME") and "tg_date" in it and not _tg_control_fresh(it["tg_date"]):
+            LOGGER.warning("丢弃排队期间过期的 TG 控制命令 type=%s", t)
+            self.tg.send("⚠️ 控制命令在等待执行时已过期，请重新发送。")
+            return
         if t == "BREAKER":
             self._start_transition(breaker=True, reason="manual_breaker")
         elif t == "MONTH_RESET":
@@ -1955,6 +2060,8 @@ class Rotator:
             if state.get("global_state") == GS_BREAKER:
                 to = self._select_target(self.store.get_runtimes())
                 if to is None:
+                    if self._wait_for_cooled_recovery(state):
+                        return
                     self._notify(
                         "切换异常",
                         "无法恢复服务：当前没有同时满足流量、运行时长、账单保护和账号状态要求的节点。",
@@ -2115,7 +2222,8 @@ class Rotator:
             if running and all(self._quota_exceeded(a, runtimes, traffic) for a in running):
                 to = self._select_target(runtimes)
                 if to is None:
-                    self._start_transition(breaker=True, reason="no_eligible")
+                    if self._select_target(runtimes, include_cooling=True) is None:
+                        self._start_transition(breaker=True, reason="no_eligible")
                 else:
                     self._start_transition(to=to, reason="traffic", stop_list=running)
             else:
@@ -2135,13 +2243,25 @@ class Rotator:
             self._sync_accounts_obs(ns, obs)
             self.sj.save(ns)
 
+    def _wait_for_cooled_recovery(self, state: dict) -> bool:
+        """保护解除时额度已恢复，所有可用目标仍处于临时冷却。"""
+        if self._select_target(self.store.get_runtimes(), include_cooling=True) is None:
+            return False
+        state.update(global_state=GS_ZERO, breaker_latched=False, duty_account=None)
+        self.sj.save(state)
+        self._notify("临时调度", "符合额度要求的节点正在冷却，冷却结束后将自动恢复。")
+        return True
+
     def _handle_degraded_zero(self, obs: dict, state: dict) -> None:
         # DEGRADED_ZERO：按 §3.2 选目标退避拉起（要求 6，设计 §8）
         now = time.time()
         if now < self._cooldown.get("_zero", 0):
             return
-        to = self._select_target(self.store.get_runtimes())
+        runtimes = self.store.get_runtimes()
+        to = self._select_target(runtimes)
         if to is None:
+            if self._select_target(runtimes, include_cooling=True) is not None:
+                return  # 每次巡检重评，冷却到期即可恢复。
             self._cooldown["_zero"] = now + self.cfg.th.stop_retry_interval_sec
             self._notify_throttled(
                 "no-eligible-zero",
@@ -2220,20 +2340,28 @@ class Rotator:
         o = obs.get(to)
         if o is not None and o.obs == OBS_RUNNING:
             meta = tr.setdefault("meta", {})
+            if to == tr.get("from") and not meta.get("t2_submitted") and not meta.get("t2_started"):
+                meta["self_already_running"] = True
             meta.setdefault("t3_started_at", time.time())
             LOGGER.info("T2 目标实例已 Running account=%s，进入 T3 服务探测", to)
             tr["step"] = STEP_T3
             return self._with_tr(state, tr)
         meta = tr.setdefault("meta", {})
         now = time.time()
-        elapsed = now - tr["started_at"]
+        # 在 T1 或未知态冻结期间还没试过启动，不消耗目标自己的启动窗口。
+        if "t2_started_at" not in meta:
+            already_attempted = (meta.get("t2_submitted") or meta.get("t2_started")
+                                 or meta.get("t2_backoff_idx") or o and o.obs == OBS_STARTING)
+            meta["t2_started_at"] = tr["started_at"] if already_attempted else now
+        elapsed = now - meta["t2_started_at"]
         if elapsed > self.cfg.th.start_timeout_sec:
             timeout = self._duration_label(self.cfg.th.start_timeout_sec)
-            return self._abort_transition(
-                tr,
-                state,
-                f"节点 {self._account_label(to)} 在 {timeout} 内未进入运行状态",
-            )
+            self._backoff_target(to)
+            reason = f"节点 {self._account_label(to)} 在 {timeout} 内未进入运行状态"
+            if (meta.get("t2_submitted") or meta.get("t2_started")
+                    or (o is not None and o.obs == OBS_STARTING)):
+                return self._rollback(tr, state, reason)
+            return self._abort_transition(tr, state, reason)
         if o is not None and o.obs == OBS_STARTING:
             LOGGER.info(
                 "T2 等待目标实例 Running account=%s status=%s elapsed=%.1fs/%.1fs",
@@ -2254,6 +2382,10 @@ class Rotator:
             )
             return self._with_tr(state, tr)
         # 发出 StartInstance（幂等：Running/Starting 直接返回）
+        pending_start = bool(meta.get("t2_submitted") or meta.get("t2_started") or meta.get("t2_ambiguous"))
+        # 先持久化请求可能发出的事实，崩溃恢复时必须完成清理。
+        meta["t2_submitted"] = True
+        self.sj.save(self._with_tr(state, tr))
         try:
             LOGGER.info(
                 "T2 调用 StartInstance account=%s observed=%s elapsed=%.1fs",
@@ -2263,6 +2395,17 @@ class Rotator:
             meta["t2_started"] = True
             LOGGER.info("T2 StartInstance 请求已提交 account=%s", to)
         except NoStockError:
+            # 首次明确无库存且观测为停止，尚无可能在途的启动请求。
+            if not pending_start:
+                meta["t2_submitted"] = False
+                if not meta.get("explicit_manual") and o.obs in (OBS_STOPPED_SC, OBS_STOPPED_KM):
+                    self._backoff_target(to)
+                    self._abort_transition(tr, state, f"节点 {self._account_label(to)} 暂时没有可用库存")
+                    next_to = self._select_target(self.store.get_runtimes())
+                    if next_to is not None and next_to != to:
+                        self._start_transition(from_=tr.get("from"),
+                                               reason=meta.get("reason", "degraded_zero"))
+                    return self.sj.load()
             idx = meta.get("t2_backoff_idx", 0)
             backs = self.cfg.th.nostock_backoff_sec
             wait = backs[min(idx, len(backs) - 1)]
@@ -2279,6 +2422,7 @@ class Rotator:
                 tr, state, f"节点 {self._account_label(to)} 所属账号可能欠费"
             )
         except CloudAPIError as e:
+            meta["t2_ambiguous"] = True
             LOGGER.warning("T2 start %s 云API错误: %s", to, e)
         return self._with_tr(state, tr)
 
@@ -2298,6 +2442,7 @@ class Rotator:
                 "T3 服务探测超时 account=%s endpoint=%s:%s elapsed=%.1fs/%.1fs",
                 to, cfg.eip, cfg.service_port, elapsed, self.cfg.th.probe_timeout_sec,
             )
+            self._backoff_target(to)
             return self._rollback(
                 tr,
                 state,
@@ -2355,7 +2500,8 @@ class Rotator:
                 LOGGER.info("T4 目标已不存在，视为停机完成 account=%s", acc)
                 continue
             # 每次实际发送停机前复核目标；熔断没有目标，允许停止所有已确认实例。
-            if now >= stop_retry_at.get(acc, 0) and tr.get("to") is not None:
+            if (now >= stop_retry_at.get(acc, 0) and tr.get("to") is not None
+                    and meta.get("reason") != "rollback"):
                 to = tr["to"]
                 if acc == to:
                     raise ValueError("停机列表包含目标实例，拒绝执行")
@@ -2545,8 +2691,8 @@ class Rotator:
                 self.sj.save(ns)
                 self._notify("切换异常", "目标节点在最终核验时已停止，系统将重新选择可用节点。")
                 return ns
-            if not (final_obs[to].obs == OBS_RUNNING and final_obs[to].eip_bound
-                    and self._probe_service(to)):
+            if final_obs[to].obs != OBS_RUNNING or (meta.get("reason") != "rollback"
+                    and not (final_obs[to].eip_bound and self._probe_service(to))):
                 return self._with_tr(state, tr)
         for a, ob in final_obs.items():
             tag_done[a] = (ob.obs == OBS_NOT_FOUND and a != to) or ob.duty_on == (a == to)
@@ -2567,15 +2713,21 @@ class Rotator:
             )
             return ns
         ns = dict(state)
-        ns["global_state"] = GS_STEADY
+        ns["global_state"] = GS_STEADY if to is not None else GS_ZERO
         ns["duty_account"] = to
         ns["transition"] = None
+        if (to is not None and (to != tr.get("from") or meta.get("t2_started"))
+                and meta.get("reason") not in ("rollback", "cleanup_multi")):
+            self._target_backoff.pop(to, None)
         self._sync_accounts_obs(ns, obs)
         self.sj.save(ns)
         LOGGER.info(
             "T5 流水线完成 from=%s to=%s reason=%s",
             tr.get("from"), to, meta.get("reason"),
         )
+        if meta.get("reason") == "rollback":
+            self._notify("切换异常", "失败目标已确认停止，系统将继续检查可用节点。")
+            return ns
         self._notify(
             "调度完成",
             f"当前节点：{self._account_label(to)}\n"
@@ -2629,7 +2781,12 @@ class Rotator:
         # T2/T3 失败可安全回滚：停新机、留旧机。转 cleanup 流水线确认新机已停。
         to = tr.get("to")
         frm = tr.get("from")
-        if to is not None and to != frm:
+        if to is not None:
+            if to == frm and tr.get("meta", {}).get("self_already_running"):
+                return self._abort_transition(tr, state, reason)
+            # 如果目标也是原节点，它未通过启动检查，回滚后不能继续将其视为在线。
+            if to == frm:
+                frm = None
             try:
                 self.clients[to].stop_instance_stopcharging()
             except CloudAPIError as e:
@@ -2730,18 +2887,20 @@ class Rotator:
                 self.cfg.accounts[a].priority, runtimes.get(a, 0)))
         return min(candidates, key=lambda a: runtimes.get(a, 0))
 
-    def _select_target(self, runtimes: dict) -> Optional[str]:
+    def _select_target(self, runtimes: dict, include_cooling: bool = False) -> Optional[str]:
         # 先按原资格条件筛选，再应用候选选择策略。
         traffic = self.store.latest_traffic(self.cfg.th.traffic_stale_sec)
-        tmax = self.cfg.th.tmax_hours * 3600
-        thresh = self.cfg.th.traffic_threshold_gb
+        now = time.time()
         eligible = [a for a in self.cfg.accounts
-                    if runtimes.get(a, 0) < tmax
-                    and a in traffic
-                    and traffic[a] < thresh
-                    and self._healthy(a)
-                    and not self._bill_exceeded(a)]
+                    if self._eligible(a, runtimes, traffic)
+                    and (include_cooling or now >= self._target_backoff.get(a, (0, 0))[1])]
         return self._pick_candidate(eligible, runtimes)
+
+    def _backoff_target(self, account: str) -> None:
+        count = self._target_backoff.get(account, (0, 0))[0] + 1
+        delay = (900, 1800, 3600)[min(count - 1, 2)]
+        self._target_backoff[account] = (count, time.time() + delay)
+        LOGGER.warning("目标 %s 失败，冷却 %s 秒 (第 %s 次)", account, delay, count)
 
     def _eligible(self, a: str, runtimes: dict, traffic: dict) -> bool:
         tmax = self.cfg.th.tmax_hours * 3600
@@ -2804,18 +2963,20 @@ class Rotator:
         if self.sj.load().get("transition") and not replace:
             LOGGER.warning("已有流水线在跑，忽略新请求(reason=%s)", reason)
             return
+        explicit_target = to is not None
         if breaker:
             stop_list = list(self.cfg.accounts.keys())
             to = None
             from_ = None
         else:
-            if from_ is None:
+            if from_ is None and self.sj.load().get("global_state") != GS_ZERO:
                 from_ = self._current_duty()
             if to is None:
                 runtimes = self.store.get_runtimes()
                 to = self._select_target(runtimes)
                 if to is None:
-                    self._start_transition(breaker=True, reason="no_eligible")  # 无 eligible -> 熔断
+                    if self._select_target(runtimes, include_cooling=True) is None:
+                        self._start_transition(breaker=True, reason="no_eligible")
                     return
             if stop_list is None:
                 # 目标机永不在停机列表：from==to（被回收账号自救拉起 / /switch 当前账号）
@@ -2838,7 +2999,7 @@ class Rotator:
             "started_at": now, "attempts": {}, "breaker": breaker,
             "deadline": now + (self.cfg.th.stop_timeout_sec if breaker else self.cfg.th.start_timeout_sec),
             "stop_list": stop_list or [],   # 单一事实源在顶层；T4 直读（熔断流水线不过 T1，不可依赖 T1 补丁）
-            "meta": {"reason": reason,
+            "meta": {"reason": reason, "explicit_manual": reason == "manual" and explicit_target,
                      "stop_done": {}, "t3_success": 0, "t2_backoff_idx": 0,
                      "last_alarm": now, "next_retry_at": 0, "t3_last": 0},
         }

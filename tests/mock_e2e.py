@@ -255,7 +255,7 @@ def s7_nostock_backoff():
     old = steady_duty(sj)
     new = "B" if old == "A" else "A"
     fakes[new].nostock_times = 2            # 新机前两次拉起库存不足
-    r.handle_tg_command("switch", 1)
+    r.handle_tg_command(f"switch {new}", 1)
     ticks(r, 40)
     duty = steady_duty(sj)
     assert duty == new, "退避重试后应成功拉起"

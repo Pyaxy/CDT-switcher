@@ -63,6 +63,7 @@ thresholds:
   traffic_threshold_gb: 188        # 非内地流量阈值；ENV: TRAFFIC_THRESHOLD_GB
   # 流量数值按字节 / 1024^3 换算；根据实际账户额度、计量单位和查询延迟设置余量。
   tmax_hours: 360                  # 每账户本月运行时长阈值；ENV: TMAX_HOURS
+  quota_handover_grace_sec: 1800   # 超额运行节点等待替代节点的最长宽限期（秒），默认 30 分钟；ENV: QUOTA_HANDOVER_GRACE_SEC
 
   # 启动、服务探测与停机
   start_timeout_sec: 600           # 目标启动等待超时；ENV: START_TIMEOUT
@@ -75,7 +76,7 @@ thresholds:
   stop_alarm_interval_sec: 1800    # 停机异常重复告警间隔；ENV: STOP_ALARM_INTERVAL
   alert_repeat_interval_sec: 1800  # 同类告警最短重复间隔；ENV: ALERT_REPEAT_INTERVAL
   observation_failure_threshold: 3  # 每节点连续实例查询失败 N 次后告警；ENV: OBSERVATION_FAILURE_THRESHOLD
-  # 成功一次清零；首次失败仍立即暂停自动启停。设为 1 可恢复立即告警。
+  # 成功一次清零；首次失败立即暂停通常的自动启停（超额宽限期到期的定向停机除外）。设为 1 可立即告警。
 
   # 数据有效期与历史清理
   traffic_stale_sec: 3600          # 候选选择接受的快照最大年龄；ENV: TRAFFIC_STALE
