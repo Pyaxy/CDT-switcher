@@ -106,6 +106,8 @@ _REASON_UI = {
     "resume": "手动恢复服务",
     "no_eligible": "没有符合条件的可用节点",
     "cleanup_multi": "检测到多台实例同时在线",
+    "adopt_running": "接管已运行节点",
+    "ineligible_running": "已运行节点不符合当班条件",
     "degraded_zero": "当前没有在线节点",
     "rollback": "切换失败后恢复原节点",
     "manual_breaker": "手动启动全局保护停机",
@@ -1363,6 +1365,7 @@ class Rotator:
         self._pending: list = []          # 已出队的待处理意图
         self._probe_fails: dict = {}      # 账号 -> 连续服务探测失败次数
         self._observation_fails: dict[str, int] = {}  # 每账号连续实例观测失败次数
+        self._last_obs: dict[str, InstanceObs] = {}
         self._arrears: set = set()        # 欠费账号（内存态，月重置清空）
         self._cooldown: dict = {}         # 账号/特殊键 -> 退避截止 epoch
         self._target_backoff: dict = {}   # 目标账号 -> (连续失败次数, 退避截止 epoch)
@@ -1774,7 +1777,9 @@ class Rotator:
         return observed
 
     def _observe_all(self) -> dict:
-        return {name: self._observe_one(name) for name in self.clients}
+        obs = {name: self._observe_one(name) for name in self.clients}
+        self._last_obs = obs
+        return obs
 
     def _account(self, obs: dict) -> None:
         # 记账：每 tick 对 RUNNING 账号累加 patrol_interval_sec（要求 2）
@@ -1919,6 +1924,9 @@ class Rotator:
             self._reconcile_month()
         state = self.sj.load()
         tr = state.get("transition")
+        if tr and not tr.get("breaker") and tr.get("meta", {}).get("reason") != "rollback":
+            if self._missing_target(tr, obs, state) is not None:
+                return True
         if not tr or tr.get("breaker") or tr.get("step") == STEP_T1:
             # T1 尚未执行云侧动作，由预检直接拒绝不合格目标；不能悄悄改写手动选择。
             return False
@@ -1973,6 +1981,22 @@ class Rotator:
         st = self.sj.load()
         if st.get("transition"):
             return
+        pending_spot = st.get("spot_reselect")
+        if isinstance(pending_spot, dict):
+            source = pending_spot.get("source")
+            duty = st.get("duty_account")
+            valid_role = (not st.get("breaker_latched") and
+                          ((st.get("global_state") == GS_STEADY and duty == source
+                            and source in obs and obs[source].obs == OBS_RUNNING)
+                           or (st.get("global_state") == GS_ZERO and duty is None
+                               and not any(o.obs in (OBS_RUNNING, OBS_STARTING) for o in obs.values()))))
+            if valid_role:
+                self._start_spot_handover(source, obs, exclude={pending_spot.get("target")})
+                st = self.sj.load()
+                if st.get("transition"):
+                    return
+            st.pop("spot_reselect", None)
+            self.sj.save(st)
         gs = st.get("global_state", GS_UNKNOWN)
         if gs == GS_BREAKER:
             # BREAKER 唯一合法形态是全员 STOPPED_SC：任何偏差都是计费泄漏。
@@ -2012,13 +2036,6 @@ class Rotator:
             self._sync_accounts_obs(st, obs)
             self.sj.save(st)
             return
-        if gs == GS_MULTI:
-            self._handle_degraded_multi(obs, st)
-            return
-        if gs == GS_ZERO:
-            self._handle_degraded_zero(obs, st)
-            return
-        # STEADY / UNKNOWN 落入：默认按稳态处理
         self._handle_steady(obs, st)
 
     def _classify(self, obs: dict, state: dict) -> dict:
@@ -2089,8 +2106,32 @@ class Rotator:
                     and account in traffic and traffic[account] >= self.cfg.th.traffic_threshold_gb):
                 self._start_transition(reason="traffic")
         elif t == "SPOT_WARN":
-            if state.get("global_state") != GS_BREAKER:
-                self._start_transition(from_=it.get("account"), reason="spot_warn")
+            account = it.get("account")
+            ob = obs.get(account)
+            if (state.get("global_state") != GS_BREAKER
+                    and account == state.get("duty_account")
+                    and ob is not None and ob.obs == OBS_RUNNING):
+                self._start_spot_handover(account, obs)
+
+    def _start_spot_handover(self, source, obs, exclude=()):
+        """Prefer another eligible instance, retaining a running source if none exists."""
+        running = source in obs and obs[source].obs == OBS_RUNNING
+        blocked = set(exclude) | ({source} if running else set())
+        candidates = [a for a, ob in obs.items()
+                      if a not in blocked and ob.obs != OBS_NOT_FOUND
+                      and not (ob.lock_recycling and ob.obs in (OBS_RUNNING, OBS_STARTING))]
+        self._last_obs = dict(obs)
+        runtimes = self.store.get_runtimes()
+        target = self._select_target(runtimes, accounts=candidates)
+        if target is None and not running:
+            # A stopped/preempted instance remains eligible for a later fresh start.
+            target = self._select_target(runtimes, accounts=[a for a, ob in obs.items()
+                                         if ob.obs != OBS_NOT_FOUND])
+        if target is not None:
+            self._start_transition(from_=source if running else None, to=target, reason="spot_warn", obs=obs)
+        elif running:
+            self._notify_throttled("spot-no-alternative", self.cfg.th.alert_repeat_interval_sec,
+                                   "抢占预警", "暂时没有其他可用节点，继续保留当前节点并重试。")
 
     def _handle_steady(self, obs: dict, state: dict) -> None:
         # 稳态维护 + 漂移纠偏(I2/I3) + STEADY 守卫触发（要求 3/5/6）
@@ -2103,20 +2144,24 @@ class Rotator:
         if len(running) == 0:
             self._handle_degraded_zero(obs, state)
             return
-        if duty is None or duty not in obs:
-            self._handle_degraded_zero(obs, state)
-            return
-        o = obs[duty]
-        if o.obs == OBS_UNKNOWN:
-            return
-        if o.obs in (OBS_STARTING, OBS_STOPPING):
+        if any(o.obs in (OBS_STARTING, OBS_STOPPING) for o in obs.values()):
             self._sync_accounts_obs(state, obs)
             self.sj.save(state)
             return
-        if o.obs != OBS_RUNNING:
-            # 当班机丢失（NOT_FOUND / STOPPED_KM / STOPPED_SC）-> 重调度
-            self._start_transition(from_=duty, reason="spot_warn")
+        if duty != running[0] or state.get("global_state") != GS_STEADY:
+            duty = running[0]
+            runtimes = self.store.get_runtimes()
+            traffic = self.store.latest_traffic(self.cfg.th.traffic_stale_sec)
+            if self._eligible(duty, runtimes, traffic):
+                # T2 直接回读 Running；后续复用连续探测和标签回读。
+                self._start_transition(from_=duty, to=duty, reason="adopt_running")
+            elif self._quota_exceeded(duty, runtimes, traffic) or not self._healthy(duty):
+                self._start_transition(from_=duty, reason="ineligible_running", obs=obs)
+            else:
+                self._notify_throttled("adopt-usage:" + duty, self.cfg.th.alert_repeat_interval_sec,
+                                       "切换异常", "唯一运行节点缺少新鲜用量数据，等待确认当班资格。")
             return
+        o = obs[duty]
 
         # 非当班账号纠偏：I2 普通停机重发 / I3 标签不符
         for a, ob in obs.items():
@@ -2180,8 +2225,11 @@ class Rotator:
                     ),
                 )
                 if self.cfg.th.auto_switch_on_service_down:
-                    self._start_transition(from_=duty, reason="service_down")
-                    return
+                    target = self._select_target(self.store.get_runtimes(),
+                                                 accounts=[a for a in obs if a != duty])
+                    if target is not None:
+                        self._start_transition(from_=duty, to=target, reason="service_down")
+                        return
 
         # 退避：避免触发后立刻重入（与 _abort 协同）
         cool = self._cooldown.get(duty, 0)
@@ -2214,7 +2262,7 @@ class Rotator:
             return
         # 触发：抢占回收预警 / 实例丢失（要求 5）
         if o.lock_recycling:
-            self._start_transition(from_=duty, reason="spot_warn")
+            self._start_spot_handover(duty, obs)
             return
 
         self._sync_accounts_obs(state, obs)
@@ -2225,12 +2273,6 @@ class Rotator:
         if any(o.obs in (OBS_STARTING, OBS_STOPPING) for o in obs.values()):
             return
         running = [a for a, o in obs.items() if o.obs == OBS_RUNNING]
-        if not running:
-            state.update(global_state=GS_ZERO, duty_account=None)
-            self._sync_accounts_obs(state, obs)
-            self.sj.save(state)
-            self._handle_degraded_zero(obs, state)
-            return
         runtimes = self.store.get_runtimes()
         traffic = self.store.latest_traffic(self.cfg.th.traffic_stale_sec)
         cands = [a for a in running if self._eligible(a, runtimes, traffic)]
@@ -2250,14 +2292,7 @@ class Rotator:
             return
         winner = self._pick_candidate(cands, runtimes)
         losers = [a for a in running if a != winner]
-        if losers:
-            self._start_transition(from_=winner, to=winner, reason="cleanup_multi", stop_list=losers)
-        else:
-            ns = dict(state)
-            ns["global_state"] = GS_STEADY
-            ns["duty_account"] = winner
-            self._sync_accounts_obs(ns, obs)
-            self.sj.save(ns)
+        self._start_transition(from_=winner, to=winner, reason="cleanup_multi", stop_list=losers)
 
     def _wait_for_cooled_recovery(self, state: dict) -> bool:
         """保护解除时额度已恢复，所有可用目标仍处于临时冷却。"""
@@ -2272,6 +2307,10 @@ class Rotator:
         # DEGRADED_ZERO：按 §3.2 选目标退避拉起（要求 6，设计 §8）
         if any(o.obs in (OBS_STARTING, OBS_STOPPING) for o in obs.values()):
             return
+        if state.get("global_state") != GS_ZERO or state.get("duty_account") is not None:
+            state.update(global_state=GS_ZERO, duty_account=None)
+            self._sync_accounts_obs(state, obs)
+            self.sj.save(state)
         now = time.time()
         if now < self._cooldown.get("_zero", 0):
             return
@@ -2310,6 +2349,19 @@ class Rotator:
             LOGGER.info("迁移 v1 流水线游标: %s -> %s", old_step, tr.get("step"))
         state = self.sj.load()
         step = tr.get("step")
+        target = tr.get("to")
+        target_obs = obs.get(target)
+        warnings = [it for it in self._pending if it.get("type") == "SPOT_WARN"
+                    and it.get("account") == target]
+        if warnings:
+            self._pending = [it for it in self._pending if it not in warnings]
+        if (not tr.get("breaker") and tr.get("meta", {}).get("reason") != "rollback"
+                and target is not None and target != tr.get("from")
+                and target_obs is not None and target_obs.obs in (OBS_RUNNING, OBS_STARTING)
+                and (warnings or target_obs.lock_recycling)):
+            # Persist the follow-up with the cleanup cursor; consume only after cleanup.
+            state["spot_reselect"] = {"source": tr.get("from"), "target": target}
+            return self._rollback(tr, state, f"目标节点 {self._account_label(target)} 收到抢占预警")
         if step == STEP_T1:
             return self._gate_t1(tr, obs, state)
         if step == STEP_T2:
@@ -2321,6 +2373,41 @@ class Rotator:
         if step == STEP_T5:
             return self._gate_t5(tr, obs, state)
         return self._abort_transition(tr, state, "遇到无法识别的切换步骤")
+
+    def _missing_target(self, tr, obs, state):
+        to = tr.get("to")
+        if to is None or to not in obs or obs[to].obs != OBS_NOT_FOUND:
+            return None
+        frm = tr.get("from")
+        source_obs = obs.get(frm)
+        running = source_obs is not None and source_obs.obs == OBS_RUNNING
+        retained = frm if running else None
+        aborted = dict(tr, **{"from": retained})
+        reason = f"节点 {self._account_label(to)} 已不存在"
+        self._abort_transition(aborted, state, reason)
+        meta = tr.get("meta", {})
+        if meta.get("explicit_manual"):
+            return self.sj.load()
+        eligible_accounts = [a for a, o in obs.items() if o.obs != OBS_NOT_FOUND]
+        # 已停或收到回收预警的原节点可以自救，但有其他可用节点时先选择其他节点。
+        deprioritize = frm is not None and (not running or source_obs.lock_recycling
+                                            or meta.get("reason") == "spot_warn")
+        preferred = [a for a in eligible_accounts if not (deprioritize and a == frm)]
+        runtimes = self.store.get_runtimes()
+        replacement = self._select_target(runtimes, accounts=preferred)
+        if replacement is None:
+            replacement = self._select_target(runtimes, accounts=eligible_accounts)
+        if replacement is not None:
+            stop_list = [a for a in (tr.get("stop_list") or []) if a != replacement]
+            if retained and retained != replacement and retained not in stop_list:
+                stop_list.append(retained)
+            self._start_transition(from_=retained, to=replacement, stop_list=stop_list,
+                                   reason=meta.get("reason", "degraded_zero"), obs=obs)
+            resumed = self.sj.load()
+            if resumed.get("transition"):
+                resumed["transition"]["meta"]["explicit_manual"] = False
+                self.sj.save(resumed)
+        return self.sj.load()
 
     def _gate_t1(self, tr, obs, state):
         # T1 双门：运行时不超 Tmax 且最近 CDT 快照不超阈值且账号健康（要求 3）
@@ -2420,10 +2507,13 @@ class Rotator:
                 if not meta.get("explicit_manual") and o.obs in (OBS_STOPPED_SC, OBS_STOPPED_KM):
                     self._backoff_target(to)
                     self._abort_transition(tr, state, f"节点 {self._account_label(to)} 暂时没有可用库存")
-                    next_to = self._select_target(self.store.get_runtimes())
-                    if next_to is not None and next_to != to:
-                        self._start_transition(from_=tr.get("from"),
-                                               reason=meta.get("reason", "degraded_zero"))
+                    if meta.get("reason") == "spot_warn":
+                        self._start_spot_handover(tr.get("from"), obs, exclude={to})
+                    else:
+                        next_to = self._select_target(self.store.get_runtimes())
+                        if next_to is not None and next_to != to:
+                            self._start_transition(from_=tr.get("from"), to=next_to,
+                                                   reason=meta.get("reason", "degraded_zero"), obs=obs)
                     return self.sj.load()
             idx = meta.get("t2_backoff_idx", 0)
             backs = self.cfg.th.nostock_backoff_sec
@@ -2761,6 +2851,9 @@ class Rotator:
         if meta.get("reason") == "rollback":
             self._notify("切换异常", "失败目标已确认停止，系统将继续检查可用节点。")
             return ns
+        if meta.get("reason") == "adopt_running":
+            self._notify("调度完成", f"已接管在线节点 {self._account_label(to)}，服务和当班标签均已确认。")
+            return ns
         self._notify(
             "调度完成",
             f"当前节点：{self._account_label(to)}\n"
@@ -2820,10 +2913,6 @@ class Rotator:
             # 如果目标也是原节点，它未通过启动检查，回滚后不能继续将其视为在线。
             if to == frm:
                 frm = None
-            try:
-                self.clients[to].stop_instance_stopcharging()
-            except SwitcherError as e:
-                LOGGER.warning("回滚停新机 %s: %s", to, e)
             new_tr = {
                 "version": TRANSITION_VERSION,
                 "from": frm, "to": frm, "step": STEP_T4,
@@ -2835,6 +2924,10 @@ class Rotator:
             }
             ns = self._with_tr(state, new_tr)
             self.sj.save(ns)
+            try:
+                self.clients[to].stop_instance_stopcharging()
+            except SwitcherError as e:
+                LOGGER.warning("回滚停新机 %s: %s", to, e)
             self._notify(
                 "切换异常",
                 "目标节点未通过可用性检查，已启动安全回滚。\n"
@@ -2926,7 +3019,8 @@ class Rotator:
         traffic = self.store.latest_traffic(self.cfg.th.traffic_stale_sec)
         now = time.time()
         eligible = [a for a in (self.cfg.accounts if accounts is None else accounts)
-                    if self._eligible(a, runtimes, traffic)
+                    if (a not in self._last_obs or self._last_obs[a].obs != OBS_NOT_FOUND)
+                    and self._eligible(a, runtimes, traffic)
                     and (include_cooling or now >= self._target_backoff.get(a, (0, 0))[1])]
         return self._pick_candidate(eligible, runtimes)
 
@@ -2992,7 +3086,7 @@ class Rotator:
         return f"{seconds} 秒"
 
     def _start_transition(self, to=None, reason="manual", from_=None,
-                          stop_list=None, breaker=False, replace=False) -> None:
+                          stop_list=None, breaker=False, replace=False, obs=None) -> None:
         # 启动一条流水线（单飞守卫 I5）。breaker=True 走熔断流水线（要求 4）
         if self.sj.load().get("transition") and not replace:
             LOGGER.warning("已有流水线在跑，忽略新请求(reason=%s)", reason)
@@ -3007,9 +3101,16 @@ class Rotator:
                 from_ = self._current_duty()
             if to is None:
                 runtimes = self.store.get_runtimes()
-                to = self._select_target(runtimes)
+                if obs is not None and any(a not in obs or obs[a].obs == OBS_UNKNOWN
+                                           for a in self.cfg.accounts):
+                    return
+                if obs is not None:
+                    self._last_obs = dict(obs)
+                present = None if obs is None else [a for a in self.cfg.accounts
+                                                     if obs[a].obs != OBS_NOT_FOUND]
+                to = self._select_target(runtimes, accounts=present)
                 if to is None:
-                    if self._select_target(runtimes, include_cooling=True) is None:
+                    if self._select_target(runtimes, include_cooling=True, accounts=present) is None:
                         self._start_transition(breaker=True, reason="no_eligible")
                     return
             if stop_list is None:
@@ -3040,6 +3141,8 @@ class Rotator:
         }
         state = self.sj.load()
         ns = self._with_tr(state, tr)
+        # Any new transition supersedes a deferred spot handover, including manual breaker.
+        ns.pop("spot_reselect", None)
         if breaker:
             ns["breaker_latched"] = True
             ns["breaker_month"] = current_month()
