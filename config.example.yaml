@@ -71,9 +71,9 @@ thresholds:
   probe_interval_sec: 5            # 服务探测间隔及快速控制周期；ENV: PROBE_INTERVAL
   probe_required_success: 3        # 进入停机阶段所需连续探测成功数；ENV: PROBE_REQUIRED_SUCCESS
   probe_timeout_sec: 240           # 服务检查超时；ENV: PROBE_TIMEOUT
-  stop_timeout_sec: 600            # 停机确认超时告警阈值；ENV: STOP_TIMEOUT
+  stop_timeout_sec: 600            # 进入停机确认后首次告警时间；ENV: STOP_TIMEOUT
   stop_retry_interval_sec: 300     # 停机请求重试间隔；ENV: STOP_RETRY_INTERVAL
-  stop_alarm_interval_sec: 1800    # 停机异常重复告警间隔；ENV: STOP_ALARM_INTERVAL
+  stop_alarm_interval_sec: 1800    # 首次告警后的重复告警间隔；ENV: STOP_ALARM_INTERVAL
   alert_repeat_interval_sec: 1800  # 同类告警最短重复间隔；ENV: ALERT_REPEAT_INTERVAL
   observation_failure_threshold: 3  # 每节点连续实例查询失败 N 次后告警；ENV: OBSERVATION_FAILURE_THRESHOLD
   # 成功一次清零；首次失败立即暂停通常的自动启停（超额宽限期到期的定向停机除外）。设为 1 可立即告警。

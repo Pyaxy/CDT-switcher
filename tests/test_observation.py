@@ -148,8 +148,12 @@ class ObservationTests(unittest.TestCase):
                 for account, cli in f.items():
                     s.set_runtime(account, 10000)
                     cli.traffic_gb = returned_usage
-                r._perform_month_reset()
-                self.assertEqual(s.get_runtimes(), {a: 0 for a in f})
+                state = j.load()
+                state["breaker_month"] = "2000-01"
+                j.save(state)
+                with patch.object(m, "month_recovery_ready", return_value=True):
+                    r._perform_month_reset()
+                self.assertEqual(s.get_runtimes(), {a: 10000 for a in f})
                 self.assertEqual(s.latest_traffic(), {a: returned_usage for a in f})
                 ticks(r)
                 if returned_usage == 0.3:

@@ -750,11 +750,16 @@ class AliyunAccountClient:
 #   - 时长用 tick 累计：每 60s reconcile 时，凡回读 Running 的实例，其账号 runtime_seconds += patrol_interval。
 #   - 不做事件配对：不依赖“启动/停止”事件，纯按观测态累加，永不错账。
 #   - 崩溃最多丢一个 tick：SQLite 立即落盘，进程被杀只可能漏掉当次未提交的一拍。
-#   - 每月 1 号清零：与 CDT 额度重置对齐，reset_month 把当月行归零。
+#   - 时长按自然月分区，新月自动从空分区开始，不覆盖已累计时长。
 
 def current_month() -> str:
     """返回当前月份 "YYYY-MM"，用作 runtime_counters 的分区键。"""
     return datetime.now(APP_TZ).strftime("%Y-%m")
+
+
+def month_recovery_ready() -> bool:
+    now = datetime.now(APP_TZ)
+    return now.day != 1 or (now.hour, now.minute) >= (0, 5)
 
 
 class StateStore:
@@ -843,18 +848,6 @@ class StateStore:
                 "(account, month, runtime_seconds) VALUES (?, ?, ?)",
                 (account, month, seconds),
             )
-            self._conn.commit()
-
-    def reset_month(self, accounts: list[str]) -> None:
-        """每月 1 号清零：把给定账号的当月行 runtime_seconds 置 0。"""
-        month = current_month()
-        with self._lock:
-            for acc in accounts:
-                self._conn.execute(
-                    "INSERT OR REPLACE INTO runtime_counters "
-                    "(account, month, runtime_seconds) VALUES (?, ?, 0)",
-                    (acc, month),
-                )
             self._conn.commit()
 
     def add_traffic(self, account: str, gb: float) -> None:
@@ -1650,29 +1643,42 @@ class Rotator:
         self.submit_intent("MONTH_RESET")
 
     def _perform_month_reset(self) -> None:
-        # 清零计数器；BREAKER 且有 eligible -> 自动拉起（设计 §8 / 契约）
-        try:
-            st = self.sj.load()
-            self.store.reset_month(list(self.cfg.accounts.keys()))
+        """兼容定时意图；实际月份检测和恢复可在启动后随时补做。"""
+        self._reconcile_month()
+
+    def _reconcile_month(self) -> None:
+        if not month_recovery_ready():
+            return
+        st = self.sj.load()
+        month = current_month()
+        processed = st.get("month_processed")
+        if st.get("breaker_latched") and not st.get("breaker_month"):
+            # 旧状态缺少触发月份：以当前观察月为基线，保守等待下一次跨月。
+            st["breaker_month"] = month
+            self.sj.save(st)
+        if not processed or processed < month:
+            # 首次升级只建立基线；不推断旧保护的触发月份。
+            st["month_processed"] = month
+            self.sj.save(st)
             self._arrears.clear()
-            if st.get("global_state") == GS_BREAKER:
-                # 上月最后一条累积流量不能用于新月份；先刷新，失败则安全地不拉起。
-                self._refresh_traffic()
-                to = self._select_target(self.store.get_runtimes())
-                if to is not None:
-                    self._start_transition(to=to, reason="month_reset")
-                    self._notify(
-                        "临时调度",
-                        "本月额度已经重置。\n"
-                        f"准备恢复节点：{self._account_label(to)}",
-                    )
-                elif not self._wait_for_cooled_recovery(st):
-                    self._notify(
-                        "切换异常",
-                        "本月额度已经重置，但目前没有符合流量、运行时长、账单保护和账号状态要求的节点可恢复。",
-                    )
-        except Exception:
-            LOGGER.exception("month_reset 异常")
+        elif processed > month:
+            return  # 时钟回拨时不能重复处理旧月。
+        breaker_month = st.get("breaker_month")
+        if not (st.get("breaker_latched") and breaker_month and breaker_month < month):
+            return
+        if st.get("transition") or st.get("global_state") != GS_BREAKER:
+            return
+        # 用量可能延迟或请求失败：保持保护，每隔一段时间重试。
+        now = time.time()
+        if now >= self._cooldown.get("_month_refresh", 0):
+            self._cooldown["_month_refresh"] = now + max(60, self.cfg.th.stop_retry_interval_sec)
+            self._refresh_traffic()
+        to = self._select_target(self.store.get_runtimes())
+        if to is not None:
+            self._start_transition(to=to, reason="month_reset")
+            self._notify("临时调度", f"本月额度已更新，准备恢复节点：{self._account_label(to)}")
+        elif self._select_target(self.store.get_runtimes(), include_cooling=True) is not None:
+            self._wait_for_cooled_recovery(st)
 
     def handle_tg_command(self, cmd: str, chat_id: int, message_date: Optional[int] = None) -> None:
         # 只入队 / 只读查询，绝不直接调云写 API（要求 8/9，TG 线程安全）
@@ -1909,6 +1915,8 @@ class Rotator:
         if self._freeze_unknown(obs):
             return True
         self._bill_budget_alerts()
+        if self._first_done:
+            self._reconcile_month()
         state = self.sj.load()
         tr = state.get("transition")
         if not tr or tr.get("breaker") or tr.get("step") == STEP_T1:
@@ -1982,7 +1990,7 @@ class Rotator:
                     continue
                 try:
                     self.clients[a].stop_instance_stopcharging()
-                except CloudAPIError as e:
+                except SwitcherError as e:
                     LOGGER.warning("BREAKER 纠偏停机 %s: %s", a, e)
                 retry_at[a] = now + self.cfg.th.stop_retry_interval_sec
                 if ob.obs == OBS_STOPPED_KM:
@@ -2119,7 +2127,7 @@ class Rotator:
                 if time.time() >= self._cooldown.get(retry_key, 0):
                     try:
                         self.clients[a].stop_instance_stopcharging()
-                    except CloudAPIError as e:
+                    except SwitcherError as e:
                         LOGGER.warning("纠偏停机 %s: %s", a, e)
                     self._cooldown[retry_key] = (
                         time.time() + self.cfg.th.stop_retry_interval_sec
@@ -2134,14 +2142,14 @@ class Rotator:
             if ob.duty_on:
                 try:
                     self.clients[a].set_duty(False)
-                except CloudAPIError as e:
+                except SwitcherError as e:
                     LOGGER.warning("纠偏标签 %s: %s", a, e)
 
         # I3 当班 duty 标签
         if not o.duty_on:
             try:
                 self.clients[duty].set_duty(True)
-            except CloudAPIError as e:
+            except SwitcherError as e:
                 LOGGER.warning("写入 duty 标签 %s: %s", duty, e)
 
         # EIP 未绑定 -> 告警（要求 6）
@@ -2214,12 +2222,20 @@ class Rotator:
 
     def _handle_degraded_multi(self, obs: dict, state: dict) -> None:
         # 仅在合格的运行节点中按配置策略保留一台，其余进入 T4 停机。
+        if any(o.obs in (OBS_STARTING, OBS_STOPPING) for o in obs.values()):
+            return
         running = [a for a, o in obs.items() if o.obs == OBS_RUNNING]
+        if not running:
+            state.update(global_state=GS_ZERO, duty_account=None)
+            self._sync_accounts_obs(state, obs)
+            self.sj.save(state)
+            self._handle_degraded_zero(obs, state)
+            return
         runtimes = self.store.get_runtimes()
         traffic = self.store.latest_traffic(self.cfg.th.traffic_stale_sec)
         cands = [a for a in running if self._eligible(a, runtimes, traffic)]
         if not cands:
-            if running and all(self._quota_exceeded(a, runtimes, traffic) for a in running):
+            if all(self._quota_exceeded(a, runtimes, traffic) for a in running):
                 to = self._select_target(runtimes)
                 if to is None:
                     if self._select_target(runtimes, include_cooling=True) is None:
@@ -2254,13 +2270,16 @@ class Rotator:
 
     def _handle_degraded_zero(self, obs: dict, state: dict) -> None:
         # DEGRADED_ZERO：按 §3.2 选目标退避拉起（要求 6，设计 §8）
+        if any(o.obs in (OBS_STARTING, OBS_STOPPING) for o in obs.values()):
+            return
         now = time.time()
         if now < self._cooldown.get("_zero", 0):
             return
         runtimes = self.store.get_runtimes()
-        to = self._select_target(runtimes)
+        present = [a for a, o in obs.items() if o.obs != OBS_NOT_FOUND]
+        to = self._select_target(runtimes, accounts=present)
         if to is None:
-            if self._select_target(runtimes, include_cooling=True) is not None:
+            if self._select_target(runtimes, include_cooling=True, accounts=present) is not None:
                 return  # 每次巡检重评，冷却到期即可恢复。
             self._cooldown["_zero"] = now + self.cfg.th.stop_retry_interval_sec
             self._notify_throttled(
@@ -2426,11 +2445,18 @@ class Rotator:
             LOGGER.warning("T2 start %s 云API错误: %s", to, e)
         return self._with_tr(state, tr)
 
+    @staticmethod
+    def _enter_t4(tr, now):
+        tr["step"] = STEP_T4
+        meta = tr.setdefault("meta", {})
+        meta["t4_started_at"] = now
+        meta.pop("last_alarm", None)
+
     def _gate_t3(self, tr, obs, state):
         # T3 服务探测：连续 probe_required_success 次成功；超时回滚（要求 3）
         to = tr.get("to")
         if to is None:
-            tr["step"] = STEP_T4
+            self._enter_t4(tr, time.time())
             return self._with_tr(state, tr)
         meta = tr.setdefault("meta", {})
         now = time.time()
@@ -2458,7 +2484,7 @@ class Rotator:
         if ok:
             meta["t3_success"] = meta.get("t3_success", 0) + 1
             if meta["t3_success"] >= self.cfg.th.probe_required_success:
-                tr["step"] = STEP_T4
+                self._enter_t4(tr, now)
         else:
             meta["t3_success"] = 0
         cfg = self.cfg.accounts[to]
@@ -2484,6 +2510,11 @@ class Rotator:
             stop_retry_at = {}  # 防御旧/损坏游标
             meta["stop_retry_at"] = stop_retry_at
         now = time.time()
+        # Legacy cursors have no T4 entry time: begin a fresh confirmation window.
+        if "t4_started_at" not in meta:
+            meta["t4_started_at"] = now
+            meta.pop("last_alarm", None)
+        t4_started_at = meta["t4_started_at"]
         all_done = True
         for acc in stop_list:
             o = obs.get(acc)
@@ -2527,7 +2558,7 @@ class Rotator:
                     try:
                         LOGGER.info("T4 检测到普通停机，重发 StopCharging account=%s", acc)
                         self.clients[acc].stop_instance_stopcharging()   # 重发 StopCharging
-                    except CloudAPIError as e:
+                    except SwitcherError as e:
                         LOGGER.warning("T4 重发停机 %s: %s", acc, e)
                     stop_retry_at[acc] = now + self.cfg.th.stop_retry_interval_sec
                 all_done = False
@@ -2540,7 +2571,7 @@ class Rotator:
                         acc, o.obs if o is not None else "NO_OBSERVATION",
                     )
                     self.clients[acc].stop_instance_stopcharging()
-                except CloudAPIError as e:
+                except SwitcherError as e:
                     LOGGER.warning("T4 停机 %s: %s", acc, e)
                 stop_retry_at[acc] = now + self.cfg.th.stop_retry_interval_sec
             all_done = False
@@ -2553,8 +2584,10 @@ class Rotator:
                              if obs.get(a) is not None and obs[a].obs == OBS_RUNNING]
             if still_running:
                 ns["global_state"] = GS_MULTI   # 双在线，标记 MULTI 直到确认
-            la = meta.get("last_alarm", tr["started_at"])
-            if now - la >= self.cfg.th.stop_alarm_interval_sec:
+            la = meta.get("last_alarm")
+            due = (t4_started_at + self.cfg.th.stop_timeout_sec if la is None
+                   else la + self.cfg.th.stop_alarm_interval_sec)
+            if now >= due:
                 meta["last_alarm"] = now
                 self._notify(
                     "切换异常",
@@ -2663,7 +2696,7 @@ class Rotator:
                     LOGGER.info("T5 duty 标签确认完成 account=%s desired=%s", account, desired)
                     continue
                 LOGGER.warning("T5 %s duty 标签回读不一致 desired=%s", account, desired)
-            except CloudAPIError as e:
+            except SwitcherError as e:
                 LOGGER.warning("T5 标签写入或回读失败 %s: %s", account, e)
             tag_retry_at[account] = now + retry_interval
             self._notify_throttled(
@@ -2742,7 +2775,7 @@ class Rotator:
         if all(ob.obs in (OBS_STOPPED_SC, OBS_NOT_FOUND)
                for a, ob in obs.items() if a != to):
             return False
-        tr["step"] = STEP_T4
+        self._enter_t4(tr, time.time())
         tr["stop_list"] = [a for a in self.cfg.accounts if a != to]
         meta = tr.setdefault("meta", {})
         meta.update(stop_done={}, stop_retry_at={}, tag_done={})
@@ -2789,7 +2822,7 @@ class Rotator:
                 frm = None
             try:
                 self.clients[to].stop_instance_stopcharging()
-            except CloudAPIError as e:
+            except SwitcherError as e:
                 LOGGER.warning("回滚停新机 %s: %s", to, e)
             new_tr = {
                 "version": TRANSITION_VERSION,
@@ -2798,7 +2831,7 @@ class Rotator:
                 "attempts": {}, "breaker": False,
                 "deadline": time.time() + self.cfg.th.stop_timeout_sec,
                 "stop_list": [to],          # 顶层单一事实源（T4 直读；rollback 流水线不过 T1）
-                "meta": {"reason": "rollback", "stop_done": {}},
+                "meta": {"reason": "rollback", "stop_done": {}, "t4_started_at": time.time()},
             }
             ns = self._with_tr(state, new_tr)
             self.sj.save(ns)
@@ -2887,11 +2920,12 @@ class Rotator:
                 self.cfg.accounts[a].priority, runtimes.get(a, 0)))
         return min(candidates, key=lambda a: runtimes.get(a, 0))
 
-    def _select_target(self, runtimes: dict, include_cooling: bool = False) -> Optional[str]:
+    def _select_target(self, runtimes: dict, include_cooling: bool = False,
+                       accounts=None) -> Optional[str]:
         # 先按原资格条件筛选，再应用候选选择策略。
         traffic = self.store.latest_traffic(self.cfg.th.traffic_stale_sec)
         now = time.time()
-        eligible = [a for a in self.cfg.accounts
+        eligible = [a for a in (self.cfg.accounts if accounts is None else accounts)
                     if self._eligible(a, runtimes, traffic)
                     and (include_cooling or now >= self._target_backoff.get(a, (0, 0))[1])]
         return self._pick_candidate(eligible, runtimes)
@@ -3001,14 +3035,17 @@ class Rotator:
             "stop_list": stop_list or [],   # 单一事实源在顶层；T4 直读（熔断流水线不过 T1，不可依赖 T1 补丁）
             "meta": {"reason": reason, "explicit_manual": reason == "manual" and explicit_target,
                      "stop_done": {}, "t3_success": 0, "t2_backoff_idx": 0,
-                     "last_alarm": now, "next_retry_at": 0, "t3_last": 0},
+                     "next_retry_at": 0, "t3_last": 0,
+                     **({"t4_started_at": now} if breaker else {})},
         }
         state = self.sj.load()
         ns = self._with_tr(state, tr)
         if breaker:
             ns["breaker_latched"] = True
+            ns["breaker_month"] = current_month()
         elif reason in ("resume", "month_reset"):
             ns["breaker_latched"] = False
+            ns.pop("breaker_month", None)
         self.sj.save(ns)
         LOGGER.info("启动流水线 reason=%s from=%s to=%s breaker=%s", reason, from_, to, breaker)
         kind = {"spot_warn": "抢占恢复", "tmax": "超限停机", "traffic": "超限停机",
@@ -3292,6 +3329,53 @@ class ProcessLock:
         self._fds.clear()
 
 
+def make_webhook_handler(id_to_account, submit_intent):
+    class WebhookHandler(BaseHTTPRequestHandler):
+        MAX_BODY_SIZE = 64 * 1024
+
+        def do_POST(self):
+            self.connection.settimeout(5)
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length < 0 or length > self.MAX_BODY_SIZE:
+                    self.send_response(413)
+                    self.end_headers()
+                    return
+                body = self.rfile.read(length)
+                if len(body) != length:
+                    raise ValueError("incomplete body")
+                data = json.loads(body.decode("utf-8"))
+                if not isinstance(data, dict):
+                    raise ValueError("event must be an object")
+                detail = data.get("detail", {})
+                if not isinstance(detail, dict):
+                    raise ValueError("detail must be an object")
+                for obj in (data, detail):
+                    if "instance_id" in obj and (not isinstance(obj["instance_id"], str)
+                                                 or not obj["instance_id"].strip()):
+                        raise ValueError("instance_id must be a nonempty string")
+                iid = data.get("instance_id") or detail.get("instance_id")
+            except (ValueError, OSError, RecursionError):
+                self.send_response(400)
+                self.end_headers()
+                return
+            acc = id_to_account.get(iid)
+            accepted = True
+            if acc:
+                accepted = submit_intent("SPOT_WARN", account=acc)
+                if accepted:
+                    LOGGER.info("[EXPERIMENTAL] webhook %s -> 抢占预警 %s", iid, acc)
+            self.send_response(200 if accepted else 503)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, *args):
+            pass
+
+    return WebhookHandler
+
+
 def main() -> None:
     # 配置路径：允许 sys.argv[1] 覆盖
     path = sys.argv[1] if len(sys.argv) > 1 else "config.yaml"
@@ -3362,38 +3446,8 @@ def _run(cfg: Config) -> None:
             wb_port = 8787
         id_to_account = {a.instance_id: name for name, a in cfg.accounts.items()}
 
-        class _WebhookHandler(BaseHTTPRequestHandler):
-            MAX_BODY_SIZE = 64 * 1024
-
-            def do_POST(self):
-                self.connection.settimeout(5)
-                try:
-                    length = int(self.headers.get("Content-Length", 0))
-                    if length < 0 or length > self.MAX_BODY_SIZE:
-                        self.send_response(413)
-                        self.end_headers()
-                        return
-                    body = self.rfile.read(length) if length else b""
-                    data = json.loads(body.decode("utf-8", "ignore")) if body else {}
-                except Exception:
-                    data = {}
-                iid = data.get("instance_id") or (data.get("detail") or {}).get("instance_id")
-                acc = id_to_account.get(iid) if iid else None
-                accepted = True
-                if acc:
-                    accepted = rotator.submit_intent("SPOT_WARN", account=acc)
-                    if accepted:
-                        LOGGER.info("[EXPERIMENTAL] webhook %s -> 抢占预警 %s", iid, acc)
-                self.send_response(200 if accepted else 503)
-                self.send_header("Content-Type", "text/plain")
-                self.end_headers()
-                self.wfile.write(b"ok")
-
-            def log_message(self, *args):
-                pass
-
         try:
-            srv = ThreadingHTTPServer((wb_host, wb_port), _WebhookHandler)
+            srv = ThreadingHTTPServer((wb_host, wb_port), make_webhook_handler(id_to_account, rotator.submit_intent))
         except OSError:
             LOGGER.exception("webhook 启动失败，主状态机继续运行")
         else:

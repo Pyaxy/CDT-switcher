@@ -84,7 +84,7 @@ class SchedulingTests(unittest.TestCase):
         self.assertIsNone(j.load().get("transition"))
         r.submit_intent("SWITCH")
         ticks(r)
-        assert_one_running(f, "A")
+        assert_one_running(f, "B")
 
     def test_explicit_manual_target_bypasses_priority_but_not_eligibility(self):
         r, f, s, j, tg = self.world()

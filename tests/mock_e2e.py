@@ -224,8 +224,12 @@ def s5_breaker_and_resume():
     for f in fakes.values():
         f.traffic_gb = 10.0
     r.traffic_job()                         # 刷新快照（解除 eligible 硬门）
-    r.month_reset()
-    ticks(r)
+    st = sj.load()
+    st["breaker_month"] = "2000-01"          # 模拟跨月仍处于保护状态
+    sj.save(st)
+    with patch.object(m, "month_recovery_ready", return_value=True):
+        r.month_reset()
+        ticks(r)
     duty2 = steady_duty(sj)
     assert_one_running(fakes, duty2)
     print("S5 全局熔断 + 月重置自动拉起 通过")
@@ -779,7 +783,7 @@ def s26_month_reset_is_serialized_intent():
     assert store.get_runtimes()[duty] == 1234, "调度器线程不得直接重置"
     assert r.intents.qsize() == 1
     r.transition_tick()
-    assert all(value == 0 for value in store.get_runtimes().values())
+    assert store.get_runtimes()[duty] == 1234, "月度意图不得覆盖本月时长"
     print("S26 月度重置进入单写者队列 通过")
 
 

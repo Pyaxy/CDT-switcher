@@ -17,6 +17,30 @@ import cdt_switcher as m
 
 
 class SafetyTests(unittest.TestCase):
+    def test_multi_waits_for_stops_then_recovers_when_traffic_returns(self):
+        rot, clients, store, journal, _ = make_world(seed_traffic=False)
+        self.addCleanup(store.close)
+        for client in clients.values():
+            client.status = "Running"
+        ticks(rot, 2)
+        self.assertEqual(journal.load()["global_state"], m.GS_MULTI)
+        clients["A"].exists = False
+        for transient in ("Starting", "Stopping"):
+            clients["B"].status = transient
+            rot.tick()
+            self.assertEqual(journal.load()["global_state"], m.GS_MULTI)
+            self.assertIsNone(journal.load().get("transition"))
+        clients["B"].status = "Stopped"
+        clients["B"].stopped_mode = "KeepCharging"
+        rot.tick()
+        self.assertEqual(journal.load()["global_state"], m.GS_ZERO)
+        self.assertIsNone(journal.load()["duty_account"])
+        for account in clients:
+            store.add_traffic(account, 0)
+        ticks(rot)
+        self.assertEqual(journal.load()["duty_account"], "B")
+        self.assertEqual(clients["B"].status, "Running")
+
     def world(self, names=("A", "B")):
         r, f, s, j, tg = make_world(account_names=names)
         self.addCleanup(s.close)

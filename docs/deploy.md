@@ -126,7 +126,7 @@ thresholds:
 
 - **账单查询**：按[账单指南](billing.md)增加只读权限并设置 `billing.enabled: true`。
 - **OOS 恢复**：按 [OOS 指南](oos-setup.md)在云端独立配置，不需要在控制器中启用开关。
-- **EventBridge Webhook**：实验性事件入口，默认关闭。启用时由部署者提供来源认证和受限的网络入口；Telegram 长轮询不需要此入口。
+- **EventBridge Webhook**：实验性事件入口，默认关闭。启用时由部署者提供来源认证和受限的网络入口；Telegram 长轮询不需要此入口。请求体须为 JSON 对象；`detail`（如提供）须为对象，`instance_id`（顶层或 `detail` 中，如提供）须为非空字符串。无效输入返回 400，超过 64 KiB 返回 413；有效但不匹配受管实例的事件返回 200 并忽略，意图队列无法接收时返回 503。
 
 ## 4. 启动前验证
 
